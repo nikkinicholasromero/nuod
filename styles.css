@@ -11,4 +11,6 @@
 
 .search-field{margin-top:12px}.search-field>label{display:block;margin-bottom:6px;color:var(--muted);font:10px DM Mono,monospace}.search-field input{width:100%;height:44px;padding:0 12px;border:1px solid var(--line);border-radius:7px;outline:0;background:#111;color:var(--text);font:14px Manrope,sans-serif}.search-field input::placeholder{color:#777}.search-field input:focus{border-color:#666;box-shadow:0 0 0 3px #ffffff18}
 
+.filters{padding:14px 16px}.mobile-nav-item{cursor:pointer}
+
 @media(max-width:759px){.country-combobox input,.search-field input{font-size:16px}}
