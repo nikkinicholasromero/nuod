@@ -40,6 +40,11 @@ function logo(item) { return item.logo ? `<img src="${item.logo}" alt="" loading
 function escapeHTML(value = '') { const node = document.createElement('div'); node.textContent = value; return node.innerHTML; }
 function streamId(item) { return `${item.channelId}|${item.url}`; }
 function cacheKey(code) { return `nuod:scan:${CACHE_VERSION}:${code}`; }
+function compareChannelNames(left, right) {
+  const leftName = left.name.toLowerCase();
+  const rightName = right.name.toLowerCase();
+  return leftName < rightName ? -1 : leftName > rightName ? 1 : 0;
+}
 
 function catalogSignature(candidates) {
   let hash = 2166136261;
@@ -115,8 +120,7 @@ function writeCountryResult(result) {
 function streamsFromIds(code, playableIds) {
   if (!playableIds) return [];
   return (state.candidatesByCountry.get(code) || [])
-    .filter(item => playableIds.has(streamId(item)) && !state.failedStreamIds.has(streamId(item)))
-    .sort((a, b) => a.name.localeCompare(b.name));
+    .filter(item => playableIds.has(streamId(item)) && !state.failedStreamIds.has(streamId(item)));
 }
 
 function playableStreams(code, result = state.scanResults.get(code)) {
@@ -641,9 +645,10 @@ function renderList(message = '', { scanning = false, preserveScroll = false } =
   const anchor = previousCards.find(card => card.offsetTop + card.offsetHeight > previousScrollTop);
   const anchorOffset = anchor ? anchor.offsetTop - previousScrollTop : 0;
   const anchorKey = anchor?.dataset.key;
-  const items = state.searchQuery
+  const visibleItems = state.searchQuery
     ? state.visible.filter(item => item.name.toLocaleLowerCase().includes(state.searchQuery))
     : state.visible;
+  const items = [...visibleItems].sort(compareChannelNames);
   el.status.hidden = !message && (items.length > 0 || scanning);
   el.status.textContent = message || (items.length || scanning ? '' : state.searchQuery ? 'No matching channels.' : 'No playable channels found for this country.');
   el.list.innerHTML = items.map(item => `<button class="channel-card ${state.active?.key === item.key ? 'active' : ''}" data-key="${item.key}"><span class="card-logo">${logo(item)}</span><span class="card-info"><strong>${escapeHTML(item.name)}</strong><small>${escapeHTML(item.countryName || 'Global')}</small></span><span class="quality">${escapeHTML(item.quality || 'LIVE')}</span></button>`).join('');
