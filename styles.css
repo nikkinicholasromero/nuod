@@ -5,3 +5,6 @@
 @media(min-width:760px){.app-shell{max-width:1100px;margin:auto;padding-bottom:84px}.filters{padding:22px 24px 16px}.country-field{width:100%}.mobile-nav{left:50%;right:auto;bottom:22px;width:250px;height:58px;padding:5px;transform:translateX(-50%);border:1px solid var(--line);border-radius:12px;box-shadow:0 15px 35px #0007}}
 
 .country-combobox>button{padding:0;display:grid;place-items:center;font-size:0;line-height:1}.country-combobox>button::after{content:'';width:7px;height:7px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:translateY(-2px) rotate(45deg)}
+
+/* Monochrome theme */
+:root{--accent:#fff}.loading-mark{border-color:#2b2b2b;border-top-color:#fff}.play-icon{border-color:#444;color:#fff}.country-combobox input:focus{border-color:#666;box-shadow:0 0 0 3px #ffffff18}.country-options li[role=option]:hover,.country-options li[aria-selected=true]{background:#242424;color:#fff}.card-logo{color:#d5d5d5;background:#1d1d1d}.mobile-nav-item.active{color:#fff;background:#1c1c1c}
