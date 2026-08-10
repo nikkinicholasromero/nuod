@@ -7,7 +7,7 @@
     <title>nuod</title>
     <link rel="preconnect" href="https://iptv-org.github.io" />
     <link rel="preconnect" href="https://cdn.jsdelivr.net" />
-    <link rel="stylesheet" href="styles.css?v=simplified-flow" />
+    <link rel="stylesheet" href="styles.css?v=field-cleanup" />
   </head>
   <body class="browse-mode">
     <div class="loading-screen" id="loadingScreen" role="status" aria-live="polite">
@@ -29,17 +29,13 @@
               <label for="countryFilter">Country</label>
               <div class="country-combobox">
                 <input id="countryFilter" value="Philippines" role="combobox" aria-autocomplete="list" aria-controls="countryOptions" aria-expanded="false" autocomplete="off" spellcheck="false" />
-                <button class="field-clear country-clear" id="countryClear" type="button" aria-label="Clear country" hidden>×</button>
                 <button id="countryToggle" type="button" aria-label="Show countries" tabindex="-1"></button>
                 <ul id="countryOptions" class="country-options" role="listbox" hidden></ul>
               </div>
             </div>
             <div class="search-field">
               <label for="channelSearch">Search</label>
-              <div class="search-control">
-                <input id="channelSearch" type="search" placeholder="Channel name" autocomplete="off" spellcheck="false" />
-                <button class="field-clear" id="searchClear" type="button" aria-label="Clear search" hidden>×</button>
-              </div>
+              <input id="channelSearch" type="search" placeholder="Channel name" autocomplete="off" spellcheck="false" />
             </div>
           </div>
           <div id="status" class="status">Loading channels…</div>
@@ -49,6 +45,6 @@
       </main>
     </div>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.0/dist/hls.min.js"></script>
-    <script src="app.js?v=simplified-flow"></script>
+    <script src="app.js?v=field-cleanup"></script>
   </body>
 </html>

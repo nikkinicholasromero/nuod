@@ -20,7 +20,7 @@ const el = {
   video: document.querySelector('#video'), list: document.querySelector('#channelList'), status: document.querySelector('#status'), scanStatus: document.querySelector('#scanStatus'),
   country: document.querySelector('#countryFilter'), countryToggle: document.querySelector('#countryToggle'), countryOptions: document.querySelector('#countryOptions'), search: document.querySelector('#channelSearch'),
   empty: document.querySelector('#playerEmpty'), loading: document.querySelector('#loadingScreen'), loadingMessage: document.querySelector('#loadingMessage'),
-  closeWatch: document.querySelector('#closeWatch'), countryClear: document.querySelector('#countryClear'), searchClear: document.querySelector('#searchClear')
+  closeWatch: document.querySelector('#closeWatch')
 };
 
 async function getData() {
@@ -468,12 +468,7 @@ function closeCountryMenu() {
   state.countryIndex = -1;
 }
 
-function syncClearButtons() {
-  el.countryClear.hidden = !el.country.value;
-  el.searchClear.hidden = !el.search.value;
-}
-
-function hideLoading() { el.loading.hidden = true; syncClearButtons(); }
+function hideLoading() { el.loading.hidden = true; }
 
 function channelFromUrl() { return new URL(location.href).searchParams.get('channel'); }
 
@@ -544,7 +539,7 @@ function handleCountryScanComplete(code, streams) {
   if (state.currentCountry === code) {
     hideScanProgress(code);
     applyCountryStreams(code, streams, { preserveScroll: true });
-    if (!state.visible.length) { el.country.value = ''; syncClearButtons(); }
+    if (!state.visible.length) el.country.value = '';
   }
 }
 
@@ -586,7 +581,6 @@ function selectCountry(name) {
   state.searchQuery = '';
   el.search.value = '';
   el.country.value = name;
-  syncClearButtons();
   closeCountryMenu();
   loadCountry(name);
 }
@@ -733,7 +727,7 @@ async function init() {
 
 el.country.addEventListener('focus', () => openCountryMenu(true));
 el.country.addEventListener('click', () => { if (el.countryOptions.hidden) openCountryMenu(true); });
-el.country.addEventListener('input', () => { syncClearButtons(); openCountryMenu(); });
+el.country.addEventListener('input', () => openCountryMenu());
 el.country.addEventListener('keydown', event => {
   if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
     event.preventDefault();
@@ -752,12 +746,6 @@ el.country.addEventListener('keydown', event => {
 el.countryToggle.addEventListener('click', () => {
   if (el.countryOptions.hidden) { el.country.focus(); openCountryMenu(true); } else closeCountryMenu();
 });
-el.countryClear.addEventListener('click', () => {
-  el.country.value = '';
-  syncClearButtons();
-  el.country.focus();
-  openCountryMenu(true);
-});
 el.countryOptions.addEventListener('mousedown', event => {
   const option = event.target.closest('[data-country]');
   if (option) event.preventDefault();
@@ -768,15 +756,6 @@ el.countryOptions.addEventListener('click', event => {
 });
 el.search.addEventListener('input', () => {
   state.searchQuery = el.search.value.trim().toLocaleLowerCase();
-  syncClearButtons();
-  el.list.scrollTop = 0;
-  renderList('', { scanning: scanner.jobs.has(state.currentCountry) });
-});
-el.searchClear.addEventListener('click', () => {
-  el.search.value = '';
-  state.searchQuery = '';
-  syncClearButtons();
-  el.search.focus();
   el.list.scrollTop = 0;
   renderList('', { scanning: scanner.jobs.has(state.currentCountry) });
 });
