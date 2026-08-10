@@ -1,5 +1,5 @@
 const API = 'https://iptv-org.github.io/api';
-const CACHE_VERSION = 3;
+const CACHE_VERSION = 4;
 const CACHE_FRESH_TTL = 60 * 60 * 1000;
 const CACHE_MAX_AGE = 24 * 60 * 60 * 1000;
 const CACHE_FLUSH_INTERVAL = 10;
@@ -67,7 +67,7 @@ function readCountryResult(code, candidates) {
     const playableIds = new Set(cached.playable.filter(id => candidateIds.has(id)));
     const complete = cached.status !== 'partial' && candidates.every(item => checkedIds.has(streamId(item)));
     return {
-      code, checkedIds, playableIds, complete,
+      code, checkedIds, playableIds, complete, hasInconclusive: Boolean(cached.inconclusive),
       fresh: complete && Date.now() - cached.checkedAt < CACHE_FRESH_TTL,
       checkedAt: cached.checkedAt || 0, updatedAt: cached.updatedAt || cached.checkedAt || 0,
       signature: catalogSignature(candidates)
@@ -86,7 +86,8 @@ function writeCountryResult(result) {
       updatedAt: result.updatedAt || Date.now(),
       catalogSignature: result.signature,
       checked: [...result.checkedIds],
-      playable: [...result.playableIds]
+      playable: [...result.playableIds],
+      inconclusive: Boolean(result.hasInconclusive)
     }));
   } catch {}
 }
@@ -164,14 +165,14 @@ async function probeHls(url, signal) {
 
 async function probeStream(item, signal) {
   try {
-    if (/\.m3u8(?:$|\?)/i.test(item.url)) return await probeHls(item.url, signal);
+    if (/\.m3u8(?:$|\?)/i.test(item.url)) return { playable: await probeHls(item.url, signal), inconclusive: false };
     const response = await fetchChecked(item.url, { headers: { Range: 'bytes=0-1023' } }, signal);
     const type = response.headers.get('content-type') || '';
     await response.body?.cancel();
-    return /video|audio|mpegurl|octet-stream/i.test(type);
+    return { playable: /video|audio|mpegurl|octet-stream/i.test(type), inconclusive: false };
   } catch (error) {
     if (signal?.aborted) throw error;
-    return false;
+    return { playable: false, inconclusive: true };
   }
 }
 
@@ -195,7 +196,7 @@ const scanner = {
       code, candidates, checkedIds, playableIds, pending, activeCount: 0,
       priority: PRIORITY_BACKGROUND, order: this.sequence += 1, sinceFlush: 0,
       checkedAt: previous?.checkedAt || 0, signature: catalogSignature(candidates), promise, resolve,
-      renderTimer: null
+      renderTimer: null, hasInconclusive: force ? false : Boolean(previous?.hasInconclusive)
     };
     this.jobs.set(code, job);
     if (!pending.length) queueMicrotask(() => this.finish(job));
@@ -285,7 +286,7 @@ const scanner = {
     const task = { job, item, controller };
     job.activeCount += 1;
     this.active.add(task);
-    probeStream(item, controller.signal).then(playable => {
+    probeStream(item, controller.signal).then(({ playable, inconclusive }) => {
       if (controller.signal.aborted) return;
       const id = streamId(item);
       const provenByPlayback = state.active && streamId(state.active) === id && el.video.readyState >= 2;
@@ -293,6 +294,7 @@ const scanner = {
       job.checkedIds.add(id);
       if ((playable || provenByPlayback) && !state.failedStreamIds.has(id)) job.playableIds.add(id);
       else job.playableIds.delete(id);
+      if (inconclusive) job.hasInconclusive = true;
       job.sinceFlush += 1;
       if (job.sinceFlush >= CACHE_FLUSH_INTERVAL) this.persistPartial(job);
       this.reportProgress(job, wasPlayable !== job.playableIds.has(id));
@@ -302,6 +304,7 @@ const scanner = {
         const wasPlayable = job.playableIds.has(id);
         job.checkedIds.add(id);
         job.playableIds.delete(id);
+        job.hasInconclusive = true;
         job.sinceFlush += 1;
         if (job.sinceFlush >= CACHE_FLUSH_INTERVAL) this.persistPartial(job);
         this.reportProgress(job, wasPlayable);
@@ -326,7 +329,7 @@ const scanner = {
     const result = {
       code: job.code,
       checkedIds: new Set(job.checkedIds), playableIds: new Set(job.playableIds),
-      complete: false, fresh: false, checkedAt: job.checkedAt,
+      complete: false, fresh: false, checkedAt: job.checkedAt, hasInconclusive: job.hasInconclusive,
       updatedAt: Date.now(), signature: job.signature
     };
     state.scanResults.set(job.code, result);
@@ -339,7 +342,7 @@ const scanner = {
     const result = {
       code: job.code,
       checkedIds: new Set(job.checkedIds), playableIds: new Set(job.playableIds),
-      complete: true, fresh: true, checkedAt: Date.now(),
+      complete: true, fresh: true, checkedAt: Date.now(), hasInconclusive: job.hasInconclusive,
       updatedAt: Date.now(), signature: job.signature
     };
     state.scanResults.set(job.code, result);
@@ -409,10 +412,12 @@ function populateCountries(countries) {
     const result = readCountryResult(country.code, state.candidatesByCountry.get(country.code) || []);
     if (result) state.scanResults.set(country.code, result);
   }
-  state.countryChoices = state.catalogCountries.filter(country => {
-    const result = state.scanResults.get(country.code);
-    return !(result?.complete && result.playableIds.size === 0);
-  });
+  state.countryChoices = state.catalogCountries.filter(country => !canHideCountry(country.code));
+}
+
+function canHideCountry(code) {
+  const result = state.scanResults.get(code);
+  return Boolean(result?.complete && result.playableIds.size === 0 && !result.hasInconclusive);
 }
 
 function refreshCountryOptions() {
@@ -529,13 +534,13 @@ function applyCountryStreams(code, streams, { scanning = false, preserveScroll =
   const active = state.active?.country === code && !state.failedStreamIds.has(streamId(state.active)) ? state.active : null;
   state.visible = active && !streams.some(item => streamId(item) === streamId(active)) ? [active, ...streams] : streams;
   if (state.visible.length) addCountry(code);
-  else if (!scanning) removeCountry(code);
+  else if (!scanning && canHideCountry(code)) removeCountry(code);
   renderList('', { scanning, preserveScroll });
 }
 
 function handleCountryScanComplete(code, streams) {
   if (streams.length || state.active?.country === code) addCountry(code);
-  else removeCountry(code);
+  else if (canHideCountry(code)) removeCountry(code);
   if (state.currentCountry === code) {
     hideScanProgress(code);
     applyCountryStreams(code, streams, { preserveScroll: true });
@@ -642,7 +647,7 @@ function removeFailedStream(item) {
   scanner.markFailed(item);
   state.visible = state.visible.filter(stream => streamId(stream) !== streamId(item));
   state.candidates = state.candidates.filter(stream => streamId(stream) !== streamId(item));
-  if (!playableStreams(item.country).length) removeCountry(item.country);
+  if (!playableStreams(item.country).length && canHideCountry(item.country)) removeCountry(item.country);
   stopPlayback({ clearUrl: true });
   showBrowse();
   renderList('That channel became unavailable and was removed.');
