@@ -430,7 +430,7 @@ function removeCountry(code) {
 
 function renderCountryOptions(query = '') {
   const normalized = query.trim().toLocaleLowerCase();
-  const matches = state.countryChoices.filter(country => !normalized || country.name.toLocaleLowerCase().includes(normalized)).slice(0, 12);
+  const matches = state.countryChoices.filter(country => !normalized || country.name.toLocaleLowerCase().includes(normalized));
   state.countryIndex = matches.length ? 0 : -1;
   el.countryOptions.innerHTML = matches.length
     ? matches.map((country, index) => `<li id="country-option-${index}" role="option" data-country="${escapeHTML(country.name)}" aria-selected="${index === 0}">${country.flag || ''}<span>${escapeHTML(country.name)}</span></li>`).join('')
