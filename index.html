@@ -7,7 +7,7 @@
     <title>nuod</title>
     <link rel="preconnect" href="https://iptv-org.github.io" />
     <link rel="preconnect" href="https://cdn.jsdelivr.net" />
-    <link rel="stylesheet" href="styles.css?v=field-cleanup" />
+    <link rel="stylesheet" href="styles.css?v=mobile-watch-toolbar" />
   </head>
   <body class="browse-mode">
     <div class="loading-screen" id="loadingScreen" role="status" aria-live="polite">
@@ -17,8 +17,10 @@
     <div class="app-shell">
       <main class="layout">
         <section class="watch-area" aria-label="Live video">
+          <div class="watch-toolbar">
+            <button class="close-watch" id="closeWatch" type="button" aria-label="Return to browse"><span class="watch-back-arrow" aria-hidden="true">‹</span><span class="watch-back-label">Browse</span></button>
+          </div>
           <div class="player-wrap">
-            <button class="close-watch" id="closeWatch" type="button" aria-label="Close video">×</button>
             <video id="video" controls playsinline></video>
             <div class="player-empty" id="playerEmpty"><div class="play-icon">▶</div><p>Choose a channel to start watching</p></div>
           </div>
