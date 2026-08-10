@@ -18,6 +18,7 @@
       <main class="layout">
         <section class="watch-area" aria-label="Live video">
           <div class="player-wrap">
+            <button class="close-watch" id="closeWatch" type="button" aria-label="Close video">×</button>
             <video id="video" controls playsinline></video>
             <div class="player-empty" id="playerEmpty"><div class="play-icon">▶</div><p>Choose a channel to start watching</p></div>
           </div>
@@ -28,13 +29,17 @@
               <label for="countryFilter">Country</label>
               <div class="country-combobox">
                 <input id="countryFilter" value="Philippines" role="combobox" aria-autocomplete="list" aria-controls="countryOptions" aria-expanded="false" autocomplete="off" spellcheck="false" />
+                <button class="field-clear country-clear" id="countryClear" type="button" aria-label="Clear country" hidden>×</button>
                 <button id="countryToggle" type="button" aria-label="Show countries" tabindex="-1"></button>
                 <ul id="countryOptions" class="country-options" role="listbox" hidden></ul>
               </div>
             </div>
             <div class="search-field">
               <label for="channelSearch">Search</label>
-              <input id="channelSearch" type="search" placeholder="Channel name" autocomplete="off" spellcheck="false" />
+              <div class="search-control">
+                <input id="channelSearch" type="search" placeholder="Channel name" autocomplete="off" spellcheck="false" />
+                <button class="field-clear" id="searchClear" type="button" aria-label="Clear search" hidden>×</button>
+              </div>
             </div>
           </div>
           <div id="status" class="status">Loading channels…</div>
@@ -43,10 +48,6 @@
         </aside>
       </main>
     </div>
-    <nav class="mobile-nav" aria-label="Primary navigation">
-      <button class="mobile-nav-item active" id="browseNav" type="button">Browse</button>
-      <button class="mobile-nav-item" id="watchNav" type="button">Watch</button>
-    </nav>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.0/dist/hls.min.js"></script>
     <script src="app.js?v=background-warming"></script>
   </body>

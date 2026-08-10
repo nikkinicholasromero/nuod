@@ -20,7 +20,7 @@ const el = {
   video: document.querySelector('#video'), list: document.querySelector('#channelList'), status: document.querySelector('#status'), scanStatus: document.querySelector('#scanStatus'),
   country: document.querySelector('#countryFilter'), countryToggle: document.querySelector('#countryToggle'), countryOptions: document.querySelector('#countryOptions'), search: document.querySelector('#channelSearch'),
   empty: document.querySelector('#playerEmpty'), loading: document.querySelector('#loadingScreen'), loadingMessage: document.querySelector('#loadingMessage'),
-  watchNav: document.querySelector('#watchNav'), browseNav: document.querySelector('#browseNav')
+  closeWatch: document.querySelector('#closeWatch'), countryClear: document.querySelector('#countryClear'), searchClear: document.querySelector('#searchClear')
 };
 
 async function getData() {
@@ -468,7 +468,12 @@ function closeCountryMenu() {
   state.countryIndex = -1;
 }
 
-function hideLoading() { el.loading.hidden = true; }
+function syncClearButtons() {
+  el.countryClear.hidden = !el.country.value;
+  el.searchClear.hidden = !el.search.value;
+}
+
+function hideLoading() { el.loading.hidden = true; syncClearButtons(); }
 
 function channelFromUrl() { return new URL(location.href).searchParams.get('channel'); }
 
@@ -539,7 +544,7 @@ function handleCountryScanComplete(code, streams) {
   if (state.currentCountry === code) {
     hideScanProgress(code);
     applyCountryStreams(code, streams, { preserveScroll: true });
-    if (!state.visible.length) el.country.value = '';
+    if (!state.visible.length) { el.country.value = ''; syncClearButtons(); }
   }
 }
 
@@ -581,6 +586,7 @@ function selectCountry(name) {
   state.searchQuery = '';
   el.search.value = '';
   el.country.value = name;
+  syncClearButtons();
   closeCountryMenu();
   loadCountry(name);
 }
@@ -607,8 +613,6 @@ function queueBackgroundScans() {
 
 function showBrowse() {
   document.body.classList.replace('watch-mode', 'browse-mode');
-  el.browseNav.classList.add('active');
-  el.watchNav.classList.remove('active');
   scanner.setBackgroundEnabled(false);
   if (state.currentCountry) {
     scanner.focus(state.currentCountry);
@@ -619,9 +623,25 @@ function showBrowse() {
 
 function showWatch() {
   document.body.classList.replace('browse-mode', 'watch-mode');
-  el.watchNav.classList.add('active');
-  el.browseNav.classList.remove('active');
   queueBackgroundScans();
+}
+
+function stopPlayback({ clearUrl = false } = {}) {
+  if (state.hls) { state.hls.destroy(); state.hls = null; }
+  el.video.pause();
+  el.video.removeAttribute('src');
+  el.video.onerror = null;
+  el.video.load();
+  state.active = null;
+  state.playbackBusy = false;
+  el.empty.hidden = false;
+  if (clearUrl) clearChannelUrl();
+}
+
+function closeWatch() {
+  stopPlayback({ clearUrl: true });
+  showBrowse();
+  renderList();
 }
 
 function removeFailedStream(item) {
@@ -629,13 +649,7 @@ function removeFailedStream(item) {
   state.visible = state.visible.filter(stream => streamId(stream) !== streamId(item));
   state.candidates = state.candidates.filter(stream => streamId(stream) !== streamId(item));
   if (!playableStreams(item.country).length) removeCountry(item.country);
-  state.active = null;
-  if (state.hls) { state.hls.destroy(); state.hls = null; }
-  el.video.pause();
-  el.video.removeAttribute('src');
-  el.video.load();
-  el.empty.hidden = false;
-  clearChannelUrl();
+  stopPlayback({ clearUrl: true });
   showBrowse();
   renderList('That channel became unavailable and was removed.');
 }
@@ -719,7 +733,7 @@ async function init() {
 
 el.country.addEventListener('focus', () => openCountryMenu(true));
 el.country.addEventListener('click', () => { if (el.countryOptions.hidden) openCountryMenu(true); });
-el.country.addEventListener('input', () => openCountryMenu());
+el.country.addEventListener('input', () => { syncClearButtons(); openCountryMenu(); });
 el.country.addEventListener('keydown', event => {
   if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
     event.preventDefault();
@@ -738,6 +752,12 @@ el.country.addEventListener('keydown', event => {
 el.countryToggle.addEventListener('click', () => {
   if (el.countryOptions.hidden) { el.country.focus(); openCountryMenu(true); } else closeCountryMenu();
 });
+el.countryClear.addEventListener('click', () => {
+  el.country.value = '';
+  syncClearButtons();
+  el.country.focus();
+  openCountryMenu(true);
+});
 el.countryOptions.addEventListener('mousedown', event => {
   const option = event.target.closest('[data-country]');
   if (option) event.preventDefault();
@@ -748,6 +768,15 @@ el.countryOptions.addEventListener('click', event => {
 });
 el.search.addEventListener('input', () => {
   state.searchQuery = el.search.value.trim().toLocaleLowerCase();
+  syncClearButtons();
+  el.list.scrollTop = 0;
+  renderList('', { scanning: scanner.jobs.has(state.currentCountry) });
+});
+el.searchClear.addEventListener('click', () => {
+  el.search.value = '';
+  state.searchQuery = '';
+  syncClearButtons();
+  el.search.focus();
   el.list.scrollTop = 0;
   renderList('', { scanning: scanner.jobs.has(state.currentCountry) });
 });
@@ -758,8 +787,7 @@ el.list.addEventListener('click', event => {
   const card = event.target.closest('[data-key]');
   if (card) play(state.visible.find(item => item.key === Number(card.dataset.key)));
 });
-el.browseNav.addEventListener('click', showBrowse);
-el.watchNav.addEventListener('click', showWatch);
+el.closeWatch.addEventListener('click', closeWatch);
 
 for (const eventName of ['waiting', 'stalled', 'seeking']) {
   el.video.addEventListener(eventName, () => { state.playbackBusy = true; scanner.refresh(); });
@@ -784,11 +812,7 @@ window.addEventListener('beforeunload', () => scanner.persistActive());
 window.addEventListener('popstate', () => {
   const requestedChannel = channelFromUrl();
   if (!requestedChannel) {
-    if (state.hls) { state.hls.destroy(); state.hls = null; }
-    el.video.pause();
-    el.empty.hidden = false;
-    state.active = null;
-    state.playbackBusy = false;
+    stopPlayback();
     showBrowse();
     renderList();
     return;
