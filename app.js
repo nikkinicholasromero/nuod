@@ -744,7 +744,7 @@ el.country.addEventListener('keydown', event => {
   }
 });
 el.countryToggle.addEventListener('click', () => {
-  if (el.countryOptions.hidden) { el.country.focus(); openCountryMenu(true); } else closeCountryMenu();
+  if (el.countryOptions.hidden) openCountryMenu(true); else closeCountryMenu();
 });
 el.countryOptions.addEventListener('mousedown', event => {
   const option = event.target.closest('[data-country]');

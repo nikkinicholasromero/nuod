@@ -15,6 +15,8 @@
 
 :root{--font-mono:'Roboto Mono',ui-monospace,SFMono-Regular,Menlo,monospace}body,.country-field>label,.country-combobox input,.scan-status,.card-logo,.quality,.search-field>label,.search-field input{font-family:var(--font-mono)}
 
+.country-options{max-height:min(60dvh,480px);overflow-y:scroll;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;touch-action:pan-y}
+
 .app-shell{padding-bottom:0}.filters{display:grid;grid-template-columns:minmax(0,1fr);gap:12px}.country-field,.search-field{min-width:0}.search-field{margin-top:0}.watch-toolbar{flex:0 0 auto;height:calc(44px + env(safe-area-inset-top));padding:max(8px,env(safe-area-inset-top)) 12px 0;background:#000}.close-watch{height:36px;padding:0 10px;display:inline-flex;align-items:center;gap:4px;border:0;border-radius:7px;background:transparent;color:var(--text);font-size:14px;font-weight:600;line-height:1;cursor:pointer}.watch-back-arrow{font-size:24px;font-weight:400;line-height:16px}.close-watch:hover,.close-watch:focus-visible{background:#222}@media(min-width:640px){.filters{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}}
 
 @media(max-width:759px){.country-combobox input,.search-field input{font-size:16px}}
