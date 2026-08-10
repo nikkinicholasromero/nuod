@@ -1,10 +1,19 @@
 const API = 'https://iptv-org.github.io/api';
-const state = { all: [], visible: [], active: null, hls: null, countryCodes: new Map(), countryChoices: [], countryIndex: -1 };
+const CACHE_VERSION = 2;
+const CACHE_TTL = 15 * 60 * 1000;
+const PROBE_CONCURRENCY = 6;
+const PROBE_TIMEOUT = 7000;
+
+const state = {
+  candidates: [], visible: [], active: null, hls: null,
+  countryCodes: new Map(), countryChoices: [], countryIndex: -1,
+  currentCountry: null, scanToken: 0
+};
+
 const el = {
   video: document.querySelector('#video'), list: document.querySelector('#channelList'), status: document.querySelector('#status'),
   country: document.querySelector('#countryFilter'), countryToggle: document.querySelector('#countryToggle'), countryOptions: document.querySelector('#countryOptions'),
-  empty: document.querySelector('#playerEmpty'), error: document.querySelector('#playerError'),
-  loading: document.querySelector('#loadingScreen'), loadingMessage: document.querySelector('#loadingMessage'),
+  empty: document.querySelector('#playerEmpty'), loading: document.querySelector('#loadingScreen'), loadingMessage: document.querySelector('#loadingMessage'),
   watchNav: document.querySelector('#watchNav'), browseNav: document.querySelector('#browseNav')
 };
 
@@ -20,18 +29,126 @@ async function getData() {
 function initials(name = 'TV') { return name.split(/\s+/).slice(0, 2).map(word => word[0]).join('').toUpperCase(); }
 function logo(item) { return item.logo ? `<img src="${item.logo}" alt="" loading="lazy" onerror="this.remove()">` : initials(item.name); }
 function escapeHTML(value = '') { const node = document.createElement('div'); node.textContent = value; return node.innerHTML; }
-function playableStream(stream, blockedChannels) {
+function cacheKey(code) { return `nuod:playable:${CACHE_VERSION}:${code}`; }
+
+function metadataAllowsStream(stream, blockedChannels) {
   const label = (stream.label || '').toLocaleLowerCase();
   const restricted = /geo|block|restrict|vpn|location|country/.test(label);
   return stream.channel && typeof stream.url === 'string' && stream.url.startsWith('https://') && !stream.referrer && !stream.user_agent && !restricted && !blockedChannels.has(stream.channel);
 }
 
+function readCachedStreams(code, candidates) {
+  try {
+    const cached = JSON.parse(localStorage.getItem(cacheKey(code)) || 'null');
+    if (!cached || Date.now() - cached.checkedAt > CACHE_TTL) return null;
+    const urls = new Set(cached.urls);
+    return candidates.filter(item => urls.has(item.url));
+  } catch { return null; }
+}
+
+function writeCachedStreams(code, streams) {
+  try { localStorage.setItem(cacheKey(code), JSON.stringify({ checkedAt: Date.now(), urls: streams.map(item => item.url) })); } catch {}
+}
+
+function invalidateCountryCache(code) {
+  try { localStorage.removeItem(cacheKey(code)); } catch {}
+}
+
+async function fetchChecked(url, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT);
+  try {
+    const response = await fetch(url, { cache: 'no-store', redirect: 'follow', ...options, signal: controller.signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchTextChecked(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT);
+  try {
+    const response = await fetch(url, { cache: 'no-store', redirect: 'follow', signal: controller.signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return await response.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function firstMediaUri(playlist) {
+  const lines = playlist.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const streamIndex = lines.findIndex(line => line.startsWith('#EXT-X-STREAM-INF'));
+  if (streamIndex >= 0) return { uri: lines.slice(streamIndex + 1).find(line => !line.startsWith('#')), nested: true };
+  return { uri: lines.find(line => !line.startsWith('#')), nested: false };
+}
+
+function taggedUri(playlist, tag) {
+  const line = playlist.split(/\r?\n/).find(entry => entry.trim().startsWith(tag));
+  return line?.match(/URI="([^"]+)"/)?.[1] || null;
+}
+
+async function probeHls(url) {
+  let playlistUrl = url;
+  for (let depth = 0; depth < 3; depth += 1) {
+    const text = await fetchTextChecked(playlistUrl);
+    if (!text.trimStart().startsWith('#EXTM3U')) return false;
+    const media = firstMediaUri(text);
+    if (!media.uri) return false;
+    const nextUrl = new URL(media.uri, playlistUrl).href;
+    if (media.nested) {
+      playlistUrl = nextUrl;
+      continue;
+    }
+    const dependencies = [taggedUri(text, '#EXT-X-KEY'), taggedUri(text, '#EXT-X-MAP'), media.uri].filter(Boolean);
+    for (const dependency of dependencies) {
+      const resource = await fetchChecked(new URL(dependency, playlistUrl).href, { headers: { Range: 'bytes=0-1023' } });
+      await resource.body?.cancel();
+    }
+    return true;
+  }
+  return false;
+}
+
+async function probeStream(item) {
+  try {
+    if (/\.m3u8(?:$|\?)/i.test(item.url)) return await probeHls(item.url);
+    const response = await fetchChecked(item.url, { headers: { Range: 'bytes=0-1023' } });
+    const type = response.headers.get('content-type') || '';
+    await response.body?.cancel();
+    return /video|audio|mpegurl|octet-stream/i.test(type);
+  } catch {
+    return false;
+  }
+}
+
+async function probeStreams(candidates, token) {
+  const playable = [];
+  let cursor = 0;
+  let checked = 0;
+  async function worker() {
+    while (cursor < candidates.length && token === state.scanToken) {
+      const item = candidates[cursor++];
+      if (await probeStream(item)) playable.push(item);
+      checked += 1;
+      el.loadingMessage.textContent = `Checking channels… ${checked}/${candidates.length}`;
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(PROBE_CONCURRENCY, candidates.length) }, worker));
+  return playable.sort((a, b) => a.name.localeCompare(b.name));
+}
+
 function populateCountries(countries) {
-  const usedCodes = new Set(state.all.map(item => item.country).filter(Boolean));
+  const usedCodes = new Set(state.candidates.map(item => item.country).filter(Boolean));
   state.countryChoices = countries.filter(country => usedCodes.has(country.code)).sort((a, b) => a.name.localeCompare(b.name));
-  state.countryChoices.forEach(country => {
-    state.countryCodes.set(country.name.toLocaleLowerCase(), country.code);
-  });
+  state.countryChoices.forEach(country => state.countryCodes.set(country.name.toLocaleLowerCase(), country.code));
+}
+
+function removeCountry(code) {
+  state.countryChoices = state.countryChoices.filter(country => country.code !== code);
+  for (const [name, countryCode] of state.countryCodes) if (countryCode === code) state.countryCodes.delete(name);
 }
 
 function renderCountryOptions(query = '') {
@@ -69,27 +186,48 @@ function closeCountryMenu() {
   state.countryIndex = -1;
 }
 
-function selectCountry(name) {
-  el.country.value = name;
-  filter();
-  closeCountryMenu();
-  el.country.focus();
+function showLoading(message) {
+  el.loadingMessage.textContent = message;
+  el.loading.hidden = false;
 }
 
-function filter() {
-  const typedCountry = el.country.value.trim().toLocaleLowerCase();
-  const countryCode = state.countryCodes.get(typedCountry);
-  state.visible = state.all.filter(item => countryCode ? item.country === countryCode : item.countryName?.toLocaleLowerCase().includes(typedCountry));
-  renderList();
-}
+function hideLoading() { el.loading.hidden = true; }
 
-function renderList() {
-  const limit = 150;
-  const items = state.visible.slice(0, limit);
-  el.status.hidden = state.visible.length > 0;
-  el.status.textContent = state.visible.length ? '' : 'No channels found for this country.';
+function renderList(message = '') {
+  const items = state.visible.slice(0, 150);
+  el.status.hidden = items.length > 0 && !message;
+  el.status.textContent = message || (items.length ? '' : 'No playable channels found for this country.');
   el.list.innerHTML = items.map(item => `<button class="channel-card ${state.active?.key === item.key ? 'active' : ''}" data-key="${item.key}"><span class="card-logo">${logo(item)}</span><span class="card-info"><strong>${escapeHTML(item.name)}</strong><small>${escapeHTML(item.countryName || 'Global')}</small></span><span class="quality">${escapeHTML(item.quality || 'LIVE')}</span></button>`).join('');
-  if (state.visible.length > limit) el.list.insertAdjacentHTML('beforeend', `<div class="status">Showing the first ${limit} channels.</div>`);
+}
+
+async function loadCountry(name) {
+  const code = state.countryCodes.get(name.trim().toLocaleLowerCase());
+  if (!code) return;
+  const token = ++state.scanToken;
+  state.currentCountry = code;
+  closeCountryMenu();
+  showLoading('Preparing channel checks…');
+  const candidates = state.candidates.filter(item => item.country === code);
+  let playable = readCachedStreams(code, candidates);
+  if (!playable) {
+    playable = await probeStreams(candidates, token);
+    if (token !== state.scanToken) return;
+    writeCachedStreams(code, playable);
+  }
+  state.visible = playable;
+  if (!playable.length) {
+    removeCountry(code);
+    el.country.value = '';
+  }
+  renderList();
+  hideLoading();
+}
+
+async function selectCountry(name) {
+  el.country.value = name;
+  closeCountryMenu();
+  await loadCountry(name);
+  el.country.focus();
 }
 
 function showBrowse() {
@@ -105,17 +243,30 @@ function showWatch() {
   el.browseNav.classList.remove('active');
 }
 
+function removeFailedStream(item) {
+  state.visible = state.visible.filter(stream => stream.url !== item.url);
+  state.candidates = state.candidates.filter(stream => stream.url !== item.url);
+  invalidateCountryCache(item.country);
+  state.active = null;
+  if (state.hls) { state.hls.destroy(); state.hls = null; }
+  el.video.pause();
+  el.video.removeAttribute('src');
+  el.video.load();
+  el.empty.hidden = false;
+  showBrowse();
+  renderList('That channel became unavailable and was removed.');
+}
+
 function play(item) {
   state.active = item;
   el.empty.hidden = true;
-  el.error.hidden = true;
-  renderList();
   showWatch();
   if (state.hls) { state.hls.destroy(); state.hls = null; }
   el.video.pause();
   el.video.removeAttribute('src');
   el.video.load();
-  const fail = () => { el.error.hidden = false; };
+  let failed = false;
+  const fail = () => { if (!failed) { failed = true; removeFailedStream(item); } };
   if (window.Hls?.isSupported() && /\.m3u8($|\?)/i.test(item.url)) {
     state.hls = new Hls({ enableWorker: true, lowLatencyMode: true });
     state.hls.loadSource(item.url);
@@ -124,29 +275,27 @@ function play(item) {
   } else {
     el.video.src = item.url;
   }
-  el.video.play().catch(() => {});
+  el.video.play().catch(fail);
   el.video.onerror = fail;
 }
 
 async function init() {
   try {
     const data = await getData();
-    el.loadingMessage.textContent = 'Filtering playable channels…';
+    el.loadingMessage.textContent = 'Building channel catalog…';
     const channels = new Map(data['channels.json'].map(channel => [channel.id, channel]));
     const countries = new Map(data['countries.json'].map(country => [country.code, country]));
     const logos = new Map(data['logos.json'].filter(item => item.in_use !== false).map(item => [item.channel, item.url]));
     const blockedChannels = new Set(data['blocklist.json'].map(item => item.channel));
     const seen = new Set();
-    state.all = data['streams.json'].filter(stream => playableStream(stream, blockedChannels) && !seen.has(`${stream.channel}|${stream.url}`) && seen.add(`${stream.channel}|${stream.url}`)).map((stream, key) => {
+    state.candidates = data['streams.json'].filter(stream => metadataAllowsStream(stream, blockedChannels) && !seen.has(`${stream.channel}|${stream.url}`) && seen.add(`${stream.channel}|${stream.url}`)).map((stream, key) => {
       const channel = channels.get(stream.channel) || {};
       const country = countries.get(channel.country);
       return { key, name: stream.title || channel.name || stream.channel, url: stream.url, quality: stream.quality, country: channel.country, countryName: country?.name, logo: logos.get(stream.channel) };
-    }).sort((a, b) => a.name.localeCompare(b.name));
+    });
     populateCountries(data['countries.json']);
-    filter();
-    el.loading.hidden = true;
+    await loadCountry('Philippines');
   } catch (error) {
-    el.status.textContent = 'Could not load the channel list. Check your connection and refresh.';
     el.loadingMessage.textContent = 'Could not load channels. Check your connection and refresh.';
     console.error(error);
   }
@@ -154,7 +303,7 @@ async function init() {
 
 el.country.addEventListener('focus', () => openCountryMenu(true));
 el.country.addEventListener('click', () => { if (el.countryOptions.hidden) openCountryMenu(true); });
-el.country.addEventListener('input', () => { filter(); openCountryMenu(); });
+el.country.addEventListener('input', () => openCountryMenu());
 el.country.addEventListener('keydown', event => {
   if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
     event.preventDefault();
@@ -182,7 +331,7 @@ document.addEventListener('mousedown', event => {
 });
 el.list.addEventListener('click', event => {
   const card = event.target.closest('[data-key]');
-  if (card) play(state.all.find(item => item.key === Number(card.dataset.key)));
+  if (card) play(state.visible.find(item => item.key === Number(card.dataset.key)));
 });
 el.browseNav.addEventListener('click', showBrowse);
 el.watchNav.addEventListener('click', showWatch);
