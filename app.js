@@ -8,12 +8,13 @@ const BACKGROUND_CONCURRENCY = 2;
 const PROBE_TIMEOUT = 7000;
 const PRIORITY_FOREGROUND = 100;
 const PRIORITY_BACKGROUND = 10;
+const EVERYWHERE = '__everywhere__';
 
 const state = {
   candidates: [], candidatesByCountry: new Map(), visible: [], active: null, hls: null,
   countryCodes: new Map(), countryByCode: new Map(), catalogCountries: [], countryChoices: [], countryIndex: -1,
   scanResults: new Map(), failedStreamIds: new Set(),
-  currentCountry: null, countryRequestId: 0, catalogReady: false, playbackBusy: false, searchQuery: ''
+  currentCountry: null, countryRequestId: 0, catalogReady: false, playbackBusy: false, searchQuery: '', everywhereRenderTimer: null
 };
 
 const el = {
@@ -319,6 +320,11 @@ const scanner = {
   },
 
   reportProgress(job, channelsChanged = false) {
+    if (state.currentCountry === EVERYWHERE) {
+      showEverywhereProgress();
+      if (channelsChanged) scheduleEverywhereRender();
+      return;
+    }
     if (state.currentCountry !== job.code) return;
     showScanProgress(job);
     if (channelsChanged) scheduleProgressiveRender(job);
@@ -415,7 +421,8 @@ function populateCountries(countries) {
 
 function renderCountryOptions(query = '') {
   const normalized = query.trim().toLocaleLowerCase();
-  const matches = state.countryChoices.filter(country => !normalized || country.name.toLocaleLowerCase().includes(normalized));
+  const choices = [{ code: EVERYWHERE, name: 'Everywhere', flag: '' }, ...state.countryChoices];
+  const matches = choices.filter(country => !normalized || country.name.toLocaleLowerCase().includes(normalized));
   state.countryIndex = matches.length ? 0 : -1;
   el.countryOptions.innerHTML = matches.length
     ? matches.map((country, index) => `<li id="country-option-${index}" role="option" data-country="${escapeHTML(country.name)}" aria-selected="${index === 0}">${country.flag || ''}<span>${escapeHTML(country.name)}</span></li>`).join('')
@@ -471,6 +478,25 @@ function showScanProgress(job) {
   el.scanStatus.hidden = false;
 }
 
+function everywhereStreams() {
+  return state.catalogCountries.flatMap(country => playableStreams(country.code));
+}
+
+function everywhereIsScanning() {
+  return [...scanner.jobs.values()].some(job => job.pending.length || job.activeCount);
+}
+
+function showEverywhereProgress() {
+  const checked = state.catalogCountries.reduce((total, country) => {
+    const job = scanner.jobs.get(country.code);
+    const result = state.scanResults.get(country.code);
+    return total + (job?.checkedIds.size ?? result?.checkedIds.size ?? 0);
+  }, 0);
+  const candidates = state.catalogCountries.reduce((total, country) => total + (state.candidatesByCountry.get(country.code)?.length || 0), 0);
+  el.scanStatus.textContent = `Scanning channels... ${checked.toLocaleString()} / ${candidates.toLocaleString()}`;
+  el.scanStatus.hidden = false;
+}
+
 function hideScanProgress(code) {
   if (!code || state.currentCountry === code) {
     el.scanStatus.hidden = true;
@@ -484,6 +510,16 @@ function scheduleProgressiveRender(job) {
     job.renderTimer = null;
     if (state.currentCountry !== job.code) return;
     applyCountryStreams(job.code, streamsFromIds(job.code, job.playableIds), { scanning: true, preserveScroll: true });
+  }, 150);
+}
+
+function scheduleEverywhereRender() {
+  if (state.everywhereRenderTimer) return;
+  state.everywhereRenderTimer = setTimeout(() => {
+    state.everywhereRenderTimer = null;
+    if (state.currentCountry !== EVERYWHERE) return;
+    state.visible = everywhereStreams();
+    renderList('', { scanning: everywhereIsScanning(), preserveScroll: true });
   }, 150);
 }
 
@@ -512,6 +548,12 @@ function applyCountryStreams(code, streams, { scanning = false, preserveScroll =
 }
 
 function handleCountryScanComplete(code, streams) {
+  if (state.currentCountry === EVERYWHERE) {
+    state.visible = everywhereStreams();
+    renderList('', { scanning: everywhereIsScanning(), preserveScroll: true });
+    if (!everywhereIsScanning()) hideScanProgress();
+    return;
+  }
   if (state.currentCountry === code) {
     hideScanProgress(code);
     applyCountryStreams(code, streams, { preserveScroll: true });
@@ -519,6 +561,7 @@ function handleCountryScanComplete(code, streams) {
 }
 
 function loadCountry(name, { background = false } = {}) {
+  if (name === EVERYWHERE) return loadEverywhere();
   const code = state.countryCodes.get(name.trim().toLocaleLowerCase());
   if (!code) return;
   state.countryRequestId += 1;
@@ -549,10 +592,28 @@ function loadCountry(name, { background = false } = {}) {
   return scan;
 }
 
+function loadEverywhere() {
+  state.countryRequestId += 1;
+  state.currentCountry = EVERYWHERE;
+  closeCountryMenu();
+  state.visible = everywhereStreams();
+
+  for (const country of state.catalogCountries) {
+    const result = state.scanResults.get(country.code);
+    scanner.request(country.code, {
+      priority: PRIORITY_FOREGROUND,
+      force: Boolean(result?.complete && !result.fresh)
+    }).catch(console.error);
+  }
+  const scanning = everywhereIsScanning();
+  renderList('', { scanning });
+  if (scanning) showEverywhereProgress(); else hideScanProgress();
+}
+
 function selectCountry(name) {
   state.searchQuery = '';
   el.search.value = '';
-  el.country.value = name;
+  el.country.value = name === EVERYWHERE ? 'Everywhere' : name;
   closeCountryMenu();
   loadCountry(name);
 }
@@ -580,7 +641,7 @@ function queueBackgroundScans() {
 function showBrowse() {
   document.body.classList.replace('watch-mode', 'browse-mode');
   scanner.setBackgroundEnabled(false);
-  if (state.currentCountry) {
+  if (state.currentCountry && state.currentCountry !== EVERYWHERE) {
     scanner.focus(state.currentCountry);
     scanner.promote(state.currentCountry);
   }
@@ -728,7 +789,7 @@ el.countryOptions.addEventListener('click', event => {
 el.search.addEventListener('input', () => {
   state.searchQuery = el.search.value.trim().toLocaleLowerCase();
   el.list.scrollTop = 0;
-  renderList('', { scanning: scanner.jobs.has(state.currentCountry) });
+  renderList('', { scanning: state.currentCountry === EVERYWHERE ? everywhereIsScanning() : scanner.jobs.has(state.currentCountry) });
 });
 document.addEventListener('mousedown', event => {
   if (!event.target.closest('.country-field')) closeCountryMenu();
