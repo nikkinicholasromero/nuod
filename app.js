@@ -921,13 +921,26 @@ el.closeWatch.addEventListener('click', closeWatch);
 for (const eventName of ['waiting', 'stalled', 'seeking']) {
   el.video.addEventListener(eventName, () => { state.playbackBusy = true; scanner.refresh(); });
 }
-for (const eventName of ['playing', 'canplay', 'seeked']) {
-  el.video.addEventListener(eventName, () => {
-    state.playbackBusy = false;
-    if (state.active) scanner.markPlayable(state.active);
-    queueBackgroundScans();
-  });
+
+function resumeBackgroundScanning() {
+  state.playbackBusy = false;
+  if (state.active) scanner.markPlayable(state.active);
+  queueBackgroundScans();
 }
+
+for (const eventName of ['playing', 'canplay', 'seeked']) {
+  el.video.addEventListener(eventName, resumeBackgroundScanning);
+}
+
+// Some browsers can recover from a stalled network request using buffered
+// media without emitting another playing event. Resume quiet scanning once
+// the video is visibly advancing with enough data to keep playing.
+el.video.addEventListener('timeupdate', () => {
+  if (state.playbackBusy && !el.video.paused && !el.video.seeking
+    && el.video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
+    resumeBackgroundScanning();
+  }
+});
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) scanner.persistActive();
