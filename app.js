@@ -250,7 +250,7 @@ function showBrowse() {
   document.body.classList.replace('watch-mode', 'browse-mode');
   el.browseNav.classList.add('active');
   el.watchNav.classList.remove('active');
-  setTimeout(() => el.country.focus(), 100);
+  closeCountryMenu();
 }
 
 function showWatch() {
