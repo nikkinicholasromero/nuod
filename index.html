@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#101418" />
+    <title>nuod — Live TV</title>
+    <link rel="preconnect" href="https://iptv-org.github.io" />
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body class="browse-mode">
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="#" aria-label="nuod home"><span class="brand-mark">n</span> nuod</a>
+      </header>
+
+      <main class="layout">
+        <section class="watch-area">
+          <div class="player-wrap" id="playerWrap">
+            <video id="video" controls playsinline></video>
+            <div class="player-empty" id="playerEmpty">
+              <div class="play-icon">▶</div>
+              <p>Choose a channel to start watching</p>
+            </div>
+            <div class="player-error" id="playerError" hidden>
+              <strong>This stream could not be played here.</strong>
+              <span>Some broadcasters limit browser playback or require a location-specific connection.</span>
+            </div>
+          </div>
+          <div class="now-playing" id="nowPlaying">
+            <div class="channel-avatar" id="nowLogo">TV</div>
+            <div><p class="eyebrow">NOW PLAYING</p><h1>Select a live channel</h1><p class="stream-meta">Explore public broadcasts from around the world.</p></div>
+          </div>
+        </section>
+
+        <aside class="browser-panel" id="guidePanel" aria-label="Channel guide">
+          <div class="browser-head">
+            <div><p class="eyebrow">CHANNEL GUIDE</p><h2>Find your next signal</h2></div>
+            <div class="guide-actions"><span id="channelCount" class="channel-count">Loading</span></div>
+          </div>
+          <label class="search-box"><span>⌕</span><input id="search" type="search" placeholder="Search channels" autocomplete="off" /></label>
+          <div class="filters"><label><span>Country</span><select id="countryFilter"><option value="">Everywhere</option></select></label><span class="all-kinds">All kinds</span></div>
+          <div id="status" class="status">Tuning the receiver…</div>
+          <div id="channelList" class="channel-list" aria-live="polite"></div>
+        </aside>
+      </main>
+    </div>
+    <nav class="mobile-nav" aria-label="Primary navigation">
+      <button class="mobile-nav-item" id="watchNav" type="button"><span>▣</span>Watch</button>
+      <button class="mobile-nav-item active" id="browseNav" type="button"><span>⌕</span>Browse</button>
+    </nav>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.0/dist/hls.min.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
