@@ -1,12 +1,14 @@
 const API = 'https://iptv-org.github.io/api';
 const CACHE_VERSION = 4;
-const CACHE_FRESH_TTL = 60 * 60 * 1000;
-const CACHE_MAX_AGE = 24 * 60 * 60 * 1000;
+const CACHE_FRESH_TTL = 24 * 60 * 60 * 1000;
+const CACHE_INCONCLUSIVE_TTL = 6 * 60 * 60 * 1000;
+const CACHE_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
 const CACHE_FLUSH_INTERVAL = 10;
 const PROBE_CONCURRENCY = 6;
 const BACKGROUND_CONCURRENCY = 2;
 const PROBE_TIMEOUT = 7000;
 const PRIORITY_FOREGROUND = 100;
+const PRIORITY_ACTIVE_BACKGROUND = 20;
 const PRIORITY_BACKGROUND = 10;
 const EVERYWHERE = '__everywhere__';
 
@@ -41,14 +43,16 @@ function cacheKey(code) { return `nuod:scan:${CACHE_VERSION}:${code}`; }
 
 function catalogSignature(candidates) {
   let hash = 2166136261;
-  for (const item of candidates) {
-    const value = streamId(item);
+  const ids = [...new Set(candidates.map(streamId))].sort();
+  for (const value of ids) {
     for (let index = 0; index < value.length; index += 1) {
       hash ^= value.charCodeAt(index);
       hash = Math.imul(hash, 16777619);
     }
+    hash ^= 255;
+    hash = Math.imul(hash, 16777619);
   }
-  return `${candidates.length}:${(hash >>> 0).toString(36)}`;
+  return `${ids.length}:${(hash >>> 0).toString(36)}`;
 }
 
 function metadataAllowsStream(stream, blockedChannels) {
@@ -62,20 +66,33 @@ function readCountryResult(code, candidates) {
     const cached = JSON.parse(localStorage.getItem(cacheKey(code)) || 'null');
     if (!cached || !Array.isArray(cached.checked) || !Array.isArray(cached.playable)) return null;
     const timestamp = cached.status === 'partial' ? cached.updatedAt : cached.checkedAt;
-    if (!timestamp || Date.now() - timestamp > CACHE_MAX_AGE) return null;
+    const age = Date.now() - timestamp;
+    if (!timestamp || !Number.isFinite(age) || age < 0 || age > CACHE_MAX_AGE) return null;
     const candidateIds = new Set(candidates.map(streamId));
     const checkedIds = new Set(cached.checked.filter(id => candidateIds.has(id)));
     const playableIds = new Set(cached.playable.filter(id => candidateIds.has(id)));
-    const complete = cached.status !== 'partial' && candidates.every(item => checkedIds.has(streamId(item)));
+    const unresolvedIds = new Set((Array.isArray(cached.unresolved) ? cached.unresolved : []).filter(id => candidateIds.has(id)));
+    for (const id of unresolvedIds) checkedIds.delete(id);
+    const complete = cached.status !== 'partial' && !unresolvedIds.size && candidates.every(item => checkedIds.has(streamId(item)));
+    const signature = catalogSignature(candidates);
     return {
-      code, checkedIds, playableIds, complete, hasInconclusive: Boolean(cached.inconclusive),
-      fresh: complete && Date.now() - cached.checkedAt < CACHE_FRESH_TTL,
+      code, checkedIds, playableIds, unresolvedIds, complete,
+      hasInconclusive: unresolvedIds.size > 0 || Boolean(cached.inconclusive), retryAt: Number(cached.retryAt) || 0,
       checkedAt: cached.checkedAt || 0, updatedAt: cached.updatedAt || cached.checkedAt || 0,
-      signature: catalogSignature(candidates)
+      signature, catalogChanged: cached.catalogSignature !== signature
     };
   } catch {
     return null;
   }
+}
+
+function validationEpochIsFresh(result, now = Date.now()) {
+  const age = now - (result?.checkedAt || 0);
+  return Boolean(result && Number.isFinite(age) && age >= 0 && age < CACHE_FRESH_TTL);
+}
+
+function resultIsFresh(result, now = Date.now()) {
+  return Boolean(result?.complete && !result.hasInconclusive && validationEpochIsFresh(result, now));
 }
 
 function writeCountryResult(result) {
@@ -88,6 +105,8 @@ function writeCountryResult(result) {
       catalogSignature: result.signature,
       checked: [...result.checkedIds],
       playable: [...result.playableIds],
+      unresolved: [...(result.unresolvedIds || [])],
+      retryAt: result.retryAt || 0,
       inconclusive: Boolean(result.hasInconclusive)
     }));
   } catch {}
@@ -185,89 +204,148 @@ function backgroundNetworkAllowed() {
 const scanner = {
   jobs: new Map(), active: new Set(), sequence: 0, backgroundEnabled: false,
 
-  createJob(code, force) {
+  plan(code) {
+    const candidates = state.candidatesByCountry.get(code) || [];
+    if (!candidates.length) return { needed: false, refresh: false };
+    const result = state.scanResults.get(code);
+    if (resultIsFresh(result)) return { needed: false, refresh: false };
+    // A partial scan only belongs to one validation generation. Once that
+    // generation is stale, start it again instead of making old checks fresh
+    // by completing only the remaining candidates.
+    if (result && !result.complete && !validationEpochIsFresh(result)) {
+      return { needed: true, refresh: true };
+    }
+    if (result?.unresolvedIds?.size) {
+      const hasUnchecked = candidates.some(item => {
+        const id = streamId(item);
+        return !result.checkedIds.has(id) && !result.unresolvedIds.has(id);
+      });
+      if (!hasUnchecked && Date.now() < result.retryAt) return { needed: false, refresh: false };
+    }
+    return { needed: true, refresh: Boolean(result?.complete) };
+  },
+
+  needsScan(code) {
+    return this.jobs.has(code) || this.plan(code).needed;
+  },
+
+  createJob(code, fullRefresh) {
     const candidates = state.candidatesByCountry.get(code) || [];
     const previous = state.scanResults.get(code);
-    const checkedIds = force ? new Set() : new Set(previous?.checkedIds || []);
+    const checkedIds = fullRefresh ? new Set() : new Set(previous?.checkedIds || []);
     const playableIds = new Set(previous?.playableIds || []);
+    const unresolvedIds = fullRefresh ? new Set() : new Set(previous?.unresolvedIds || []);
+    for (const id of unresolvedIds) checkedIds.delete(id);
     const pending = candidates.filter(item => !checkedIds.has(streamId(item)));
     let resolve;
     const promise = new Promise(done => { resolve = done; });
     const job = {
-      code, candidates, checkedIds, playableIds, pending, activeCount: 0,
+      code, candidates, checkedIds, playableIds, unresolvedIds, pending, activeCount: 0,
       priority: PRIORITY_BACKGROUND, order: this.sequence += 1, sinceFlush: 0,
-      checkedAt: previous?.checkedAt || 0, signature: catalogSignature(candidates), promise, resolve,
-      renderTimer: null, dispatchCount: 0, hasInconclusive: force ? false : Boolean(previous?.hasInconclusive)
+      checkedAt: fullRefresh || !previous ? 0 : previous.checkedAt || 0,
+      signature: catalogSignature(candidates), promise, resolve,
+      renderTimer: null, dispatchCount: 0, hasInconclusive: unresolvedIds.size > 0
     };
     this.jobs.set(code, job);
     if (!pending.length) queueMicrotask(() => this.finish(job));
     return job;
   },
 
-  request(code, { priority = PRIORITY_BACKGROUND, force = false } = {}) {
-    const previous = state.scanResults.get(code);
-    if (!force && previous?.complete) return Promise.resolve(playableStreams(code, previous));
-    const job = this.jobs.get(code) || this.createJob(code, force);
+  request(code, { priority = PRIORITY_BACKGROUND, defer = false } = {}) {
+    const existing = this.jobs.get(code);
+    if (existing) {
+      existing.priority = Math.max(existing.priority, priority);
+      this.reportProgress(existing, false);
+      if (!defer) this.rebalance();
+      return existing.promise;
+    }
+    const plan = this.plan(code);
+    if (!plan.needed) return Promise.resolve(playableStreams(code));
+    const job = this.createJob(code, plan.refresh);
     job.priority = Math.max(job.priority, priority);
     this.reportProgress(job, false);
-    this.pump();
+    if (!defer) this.rebalance();
     return job.promise;
   },
 
-  focus(code) {
+  focus(code, { defer = false } = {}) {
     for (const job of this.jobs.values()) {
-      if (job.code !== code && job.priority >= PRIORITY_FOREGROUND) job.priority = PRIORITY_BACKGROUND;
+      job.priority = job.code === code ? PRIORITY_FOREGROUND : PRIORITY_BACKGROUND;
     }
-    for (const task of this.active) {
-      if (task.job.code !== code) task.controller.abort();
+    if (code) {
+      for (const task of this.active) {
+        if (task.job.code !== code) task.controller.abort();
+      }
     }
-    this.pump();
-  },
-
-  promote(code) {
-    const job = this.jobs.get(code);
-    if (!job) return;
-    job.priority = PRIORITY_FOREGROUND;
-    this.reportProgress(job, true);
-    this.pump();
+    if (!defer) this.rebalance();
   },
 
   promoteAll() {
     for (const job of this.jobs.values()) job.priority = PRIORITY_FOREGROUND;
-    this.pump();
+    this.rebalance();
   },
 
-  demoteAll() {
-    for (const job of this.jobs.values()) job.priority = PRIORITY_BACKGROUND;
-    this.refresh();
+  demoteAll(preferredCode = null) {
+    for (const job of this.jobs.values()) {
+      job.priority = job.code === preferredCode ? PRIORITY_ACTIVE_BACKGROUND : PRIORITY_BACKGROUND;
+    }
+    this.rebalance();
   },
 
   setBackgroundEnabled(enabled) {
     this.backgroundEnabled = enabled;
-    this.refresh();
+    this.rebalance();
   },
 
   canRunBackground() {
     return this.backgroundEnabled && backgroundNetworkAllowed();
   },
 
-  refresh() {
-    if (!this.canRunBackground()) {
-      for (const task of this.active) {
-        if (task.job.priority < PRIORITY_FOREGROUND) task.controller.abort();
-      }
+  hasForeground() {
+    return [...this.jobs.values()].some(job => job.priority >= PRIORITY_FOREGROUND && (job.pending.length || job.activeCount));
+  },
+
+  concurrencyLimit(foregroundExists = this.hasForeground()) {
+    if (!navigator.onLine || document.hidden) return 0;
+    if (foregroundExists) return PROBE_CONCURRENCY;
+    return this.canRunBackground() ? BACKGROUND_CONCURRENCY : 0;
+  },
+
+  rebalance() {
+    const foregroundExists = this.hasForeground();
+    const limit = this.concurrencyLimit(foregroundExists);
+    for (const task of this.active) {
+      if (task.controller.signal.aborted) continue;
+      const eligible = navigator.onLine && (foregroundExists
+        ? task.job.priority >= PRIORITY_FOREGROUND
+        : this.canRunBackground());
+      if (!eligible) task.controller.abort();
     }
+    const survivors = [...this.active]
+      .filter(task => !task.controller.signal.aborted)
+      .sort((a, b) => b.job.priority - a.job.priority || a.job.order - b.job.order);
+    for (const task of survivors.slice(limit)) task.controller.abort();
     this.pump();
   },
 
+  refresh() {
+    this.rebalance();
+  },
+
   nextJob() {
+    if (!this.concurrencyLimit()) return null;
     const jobs = [...this.jobs.values()].filter(job => job.pending.length);
-    const foregroundExists = [...this.jobs.values()].some(job => job.priority >= PRIORITY_FOREGROUND && (job.pending.length || job.activeCount));
+    const foregroundExists = this.hasForeground();
     const spreadAcrossCountries = state.currentCountry === EVERYWHERE;
     // Keep background work to one worker per country so a large catalog cannot occupy both lanes.
-    const eligible = jobs.filter(job => foregroundExists
-      ? job.priority >= PRIORITY_FOREGROUND && (!spreadAcrossCountries || job.activeCount === 0)
-      : this.canRunBackground() && job.activeCount === 0);
+    let eligible;
+    if (foregroundExists) {
+      const foreground = jobs.filter(job => job.priority >= PRIORITY_FOREGROUND);
+      const inactive = spreadAcrossCountries ? foreground.filter(job => job.activeCount === 0) : foreground;
+      eligible = inactive.length ? inactive : foreground;
+    } else {
+      eligible = jobs.filter(job => this.canRunBackground() && job.activeCount === 0);
+    }
     return eligible.sort((a, b) => b.priority - a.priority
       || (spreadAcrossCountries ? a.dispatchCount - b.dispatchCount : 0)
       || a.order - b.order)[0] || null;
@@ -275,10 +353,10 @@ const scanner = {
 
   pump() {
     while (true) {
+      const concurrency = this.concurrencyLimit();
+      if (!concurrency || this.active.size >= concurrency) return;
       const job = this.nextJob();
       if (!job) return;
-      const concurrency = job.priority >= PRIORITY_FOREGROUND ? PROBE_CONCURRENCY : BACKGROUND_CONCURRENCY;
-      if (this.active.size >= concurrency) return;
       this.start(job);
     }
   },
@@ -286,6 +364,7 @@ const scanner = {
   start(job) {
     const item = job.pending.shift();
     if (!item) return;
+    if (!job.checkedAt) job.checkedAt = Date.now();
     job.dispatchCount += 1;
     const controller = new AbortController();
     const task = { job, item, controller };
@@ -296,10 +375,16 @@ const scanner = {
       const id = streamId(item);
       const provenByPlayback = state.active && streamId(state.active) === id && el.video.readyState >= 2;
       const wasPlayable = job.playableIds.has(id);
-      job.checkedIds.add(id);
-      if ((playable || provenByPlayback) && !state.failedStreamIds.has(id)) job.playableIds.add(id);
-      else job.playableIds.delete(id);
-      if (inconclusive) job.hasInconclusive = true;
+      if (inconclusive && !provenByPlayback) {
+        job.checkedIds.delete(id);
+        job.unresolvedIds.add(id);
+        job.hasInconclusive = true;
+      } else {
+        job.checkedIds.add(id);
+        job.unresolvedIds.delete(id);
+        if ((playable || provenByPlayback) && !state.failedStreamIds.has(id)) job.playableIds.add(id);
+        else job.playableIds.delete(id);
+      }
       job.sinceFlush += 1;
       if (job.sinceFlush >= CACHE_FLUSH_INTERVAL) this.persistPartial(job);
       this.reportProgress(job, wasPlayable !== job.playableIds.has(id));
@@ -307,8 +392,8 @@ const scanner = {
       if (!controller.signal.aborted) {
         const id = streamId(item);
         const wasPlayable = job.playableIds.has(id);
-        job.checkedIds.add(id);
-        job.playableIds.delete(id);
+        job.checkedIds.delete(id);
+        job.unresolvedIds.add(id);
         job.hasInconclusive = true;
         job.sinceFlush += 1;
         if (job.sinceFlush >= CACHE_FLUSH_INTERVAL) this.persistPartial(job);
@@ -339,7 +424,8 @@ const scanner = {
     const result = {
       code: job.code,
       checkedIds: new Set(job.checkedIds), playableIds: new Set(job.playableIds),
-      complete: false, fresh: false, checkedAt: job.checkedAt, hasInconclusive: job.hasInconclusive,
+      unresolvedIds: new Set(job.unresolvedIds), retryAt: 0,
+      complete: false, checkedAt: job.checkedAt, hasInconclusive: job.hasInconclusive,
       updatedAt: Date.now(), signature: job.signature
     };
     state.scanResults.set(job.code, result);
@@ -349,10 +435,12 @@ const scanner = {
   finish(job) {
     if (this.jobs.get(job.code) !== job || job.activeCount || job.pending.length) return;
     if (job.renderTimer) clearTimeout(job.renderTimer);
+    const complete = job.unresolvedIds.size === 0;
     const result = {
       code: job.code,
       checkedIds: new Set(job.checkedIds), playableIds: new Set(job.playableIds),
-      complete: true, fresh: true, checkedAt: Date.now(), hasInconclusive: job.hasInconclusive,
+      unresolvedIds: new Set(job.unresolvedIds), retryAt: complete ? 0 : Date.now() + CACHE_INCONCLUSIVE_TTL,
+      complete, checkedAt: job.checkedAt, hasInconclusive: !complete,
       updatedAt: Date.now(), signature: job.signature
     };
     state.scanResults.set(job.code, result);
@@ -370,6 +458,7 @@ const scanner = {
     if (job) {
       job.checkedIds.add(id);
       job.playableIds.add(id);
+      job.unresolvedIds.delete(id);
       job.pending = job.pending.filter(candidate => streamId(candidate) !== id);
       this.reportProgress(job, true);
       if (!job.pending.length && !job.activeCount) this.finish(job);
@@ -378,6 +467,12 @@ const scanner = {
     if (result) {
       result.checkedIds.add(id);
       result.playableIds.add(id);
+      result.unresolvedIds?.delete(id);
+      if ((state.candidatesByCountry.get(item.country) || []).every(candidate => result.checkedIds.has(streamId(candidate)))) {
+        result.complete = true;
+        result.retryAt = 0;
+        result.hasInconclusive = false;
+      }
       result.updatedAt = Date.now();
       writeCountryResult(result);
     }
@@ -391,6 +486,7 @@ const scanner = {
       const wasPlayable = job.playableIds.has(id);
       job.checkedIds.add(id);
       job.playableIds.delete(id);
+      job.unresolvedIds.delete(id);
       job.pending = job.pending.filter(candidate => streamId(candidate) !== id);
       this.persistPartial(job);
       this.reportProgress(job, wasPlayable);
@@ -400,6 +496,12 @@ const scanner = {
     if (result) {
       result.checkedIds.add(id);
       result.playableIds.delete(id);
+      result.unresolvedIds?.delete(id);
+      if ((state.candidatesByCountry.get(item.country) || []).every(candidate => result.checkedIds.has(streamId(candidate)))) {
+        result.complete = true;
+        result.retryAt = 0;
+        result.hasInconclusive = false;
+      }
       result.updatedAt = Date.now();
       writeCountryResult(result);
     }
@@ -407,7 +509,7 @@ const scanner = {
 
   persistActive() {
     for (const job of this.jobs.values()) {
-      if (job.checkedIds.size) this.persistPartial(job);
+      if (job.checkedIds.size || job.unresolvedIds.size) this.persistPartial(job);
     }
   }
 };
@@ -418,7 +520,10 @@ function populateCountries(countries) {
     state.countryCodes.set(country.name.toLocaleLowerCase(), country.code);
     state.countryByCode.set(country.code, country);
     const result = readCountryResult(country.code, state.candidatesByCountry.get(country.code) || []);
-    if (result) state.scanResults.set(country.code, result);
+    if (result) {
+      state.scanResults.set(country.code, result);
+      if (result.catalogChanged) writeCountryResult(result);
+    }
   }
   state.countryChoices = state.catalogCountries;
 }
@@ -574,27 +679,22 @@ function loadCountry(name, { background = false } = {}) {
   state.currentCountry = code;
   closeCountryMenu();
   hideScanProgress();
-  if (!background) scanner.focus(code);
-
   const result = state.scanResults.get(code);
   const cachedStreams = playableStreams(code, result);
-  if (result) {
-    applyCountryStreams(code, cachedStreams, { scanning: true });
-    const priority = background ? PRIORITY_BACKGROUND : PRIORITY_FOREGROUND;
-    const scan = scanner.request(code, { priority, force: result.complete });
-    scan.catch(console.error);
-    return scan;
-  }
+  const needsScan = scanner.needsScan(code);
+  applyCountryStreams(code, cachedStreams, { scanning: needsScan });
 
-  if (background) {
-    const scan = scanner.request(code, { priority: PRIORITY_BACKGROUND });
-    scan.catch(console.error);
-    return scan;
+  let scan;
+  if (needsScan && background) {
+    scan = scanner.request(code, { priority: PRIORITY_ACTIVE_BACKGROUND });
+  } else if (needsScan) {
+    scanner.focus(code, { defer: true });
+    scan = scanner.request(code, { priority: PRIORITY_FOREGROUND });
+  } else if (!background) {
+    scanner.focus(null);
   }
-
-  applyCountryStreams(code, [], { scanning: true });
-  const scan = scanner.request(code, { priority: PRIORITY_FOREGROUND });
-  scan.catch(console.error);
+  scan?.catch(console.error);
+  queueBackgroundScans();
   return scan;
 }
 
@@ -603,17 +703,18 @@ function loadEverywhere() {
   state.currentCountry = EVERYWHERE;
   closeCountryMenu();
   state.visible = everywhereStreams();
+  scanner.focus(null, { defer: true });
 
   for (const country of state.catalogCountries) {
-    const result = state.scanResults.get(country.code);
-    scanner.request(country.code, {
-      priority: PRIORITY_FOREGROUND,
-      force: Boolean(result?.complete)
-    }).catch(console.error);
+    if (scanner.needsScan(country.code)) {
+      scanner.request(country.code, { priority: PRIORITY_FOREGROUND, defer: true }).catch(console.error);
+    }
   }
+  scanner.rebalance();
   const scanning = everywhereIsScanning();
   renderList('', { scanning });
   if (scanning) showEverywhereProgress(); else hideScanProgress();
+  queueBackgroundScans();
 }
 
 function selectCountry(name) {
@@ -633,33 +734,36 @@ function backgroundQueueRank(country) {
 
 function queueBackgroundScans() {
   if (!state.catalogReady) return;
-  scanner.setBackgroundEnabled(Boolean(state.active));
-  if (!state.active) return;
+  scanner.setBackgroundEnabled(true);
   const countries = state.catalogCountries
-    .filter(country => !state.scanResults.get(country.code)?.fresh)
+    .filter(country => (state.candidatesByCountry.get(country.code)?.length || 0) > 0 && scanner.needsScan(country.code))
     .sort((a, b) => backgroundQueueRank(a) - backgroundQueueRank(b));
   for (const country of countries) {
-    const result = state.scanResults.get(country.code);
-    scanner.request(country.code, { priority: PRIORITY_BACKGROUND, force: Boolean(result?.complete) }).catch(console.error);
+    const priority = country.code === state.active?.country ? PRIORITY_ACTIVE_BACKGROUND : PRIORITY_BACKGROUND;
+    scanner.request(country.code, { priority }).catch(console.error);
   }
 }
 
 function showBrowse() {
   document.body.classList.replace('watch-mode', 'browse-mode');
-  scanner.setBackgroundEnabled(false);
   if (state.currentCountry === EVERYWHERE) {
     scanner.promoteAll();
     if (everywhereIsScanning()) showEverywhereProgress();
   } else if (state.currentCountry) {
-    scanner.focus(state.currentCountry);
-    scanner.promote(state.currentCountry);
+    if (scanner.needsScan(state.currentCountry)) {
+      scanner.focus(state.currentCountry, { defer: true });
+      scanner.request(state.currentCountry, { priority: PRIORITY_FOREGROUND }).catch(console.error);
+    } else {
+      scanner.focus(null);
+    }
   }
+  queueBackgroundScans();
   closeCountryMenu();
 }
 
 function showWatch() {
   document.body.classList.replace('browse-mode', 'watch-mode');
-  scanner.demoteAll();
+  scanner.demoteAll(state.active?.country);
   queueBackgroundScans();
 }
 
