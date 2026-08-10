@@ -7,12 +7,12 @@
     <title>nuod</title>
     <link rel="preconnect" href="https://iptv-org.github.io" />
     <link rel="preconnect" href="https://cdn.jsdelivr.net" />
-    <link rel="stylesheet" href="styles.css?v=monochrome" />
+    <link rel="stylesheet" href="styles.css?v=progressive" />
   </head>
   <body class="browse-mode">
     <div class="loading-screen" id="loadingScreen" role="status" aria-live="polite">
       <div class="loading-mark"></div>
-      <p id="loadingMessage">Scanning available channels…</p>
+      <p id="loadingMessage">Loading channel catalog...</p>
     </div>
     <div class="app-shell">
       <main class="layout">
@@ -35,6 +35,7 @@
           </div>
           <div id="status" class="status">Loading channels…</div>
           <div id="channelList" class="channel-list" aria-live="polite"></div>
+          <div id="scanStatus" class="scan-status" role="status" aria-live="polite" hidden></div>
         </aside>
       </main>
     </div>
@@ -43,6 +44,6 @@
       <button class="mobile-nav-item active" id="browseNav" type="button"><span>⌕</span>Browse</button>
     </nav>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.0/dist/hls.min.js"></script>
-    <script src="app.js?v=scan3"></script>
+    <script src="app.js?v=progressive"></script>
   </body>
 </html>
