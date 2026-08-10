@@ -261,7 +261,10 @@ const scanner = {
   nextJob() {
     const jobs = [...this.jobs.values()].filter(job => job.pending.length);
     const foregroundExists = [...this.jobs.values()].some(job => job.priority >= PRIORITY_FOREGROUND && (job.pending.length || job.activeCount));
-    const eligible = jobs.filter(job => foregroundExists ? job.priority >= PRIORITY_FOREGROUND : this.canRunBackground());
+    // Keep background work to one worker per country so a large catalog cannot occupy both lanes.
+    const eligible = jobs.filter(job => foregroundExists
+      ? job.priority >= PRIORITY_FOREGROUND
+      : this.canRunBackground() && job.activeCount === 0);
     return eligible.sort((a, b) => b.priority - a.priority || a.order - b.order)[0] || null;
   },
 
@@ -391,7 +394,9 @@ const scanner = {
   },
 
   persistActive() {
-    for (const job of this.jobs.values()) this.persistPartial(job);
+    for (const job of this.jobs.values()) {
+      if (job.checkedIds.size) this.persistPartial(job);
+    }
   }
 };
 
@@ -580,13 +585,22 @@ function selectCountry(name) {
   loadCountry(name);
 }
 
+function backgroundQueueRank(country) {
+  const result = state.scanResults.get(country.code);
+  if (result && !result.complete) return 0;
+  if (!result) return 1;
+  return 2;
+}
+
 function queueBackgroundScans() {
   if (!state.catalogReady) return;
   scanner.setBackgroundEnabled(Boolean(state.active));
   if (!state.active) return;
-  for (const country of state.catalogCountries) {
+  const countries = state.catalogCountries
+    .filter(country => !state.scanResults.get(country.code)?.fresh)
+    .sort((a, b) => backgroundQueueRank(a) - backgroundQueueRank(b));
+  for (const country of countries) {
     const result = state.scanResults.get(country.code);
-    if (result?.complete && result.fresh) continue;
     scanner.request(country.code, { priority: PRIORITY_BACKGROUND, force: Boolean(result?.complete) }).catch(console.error);
   }
 }
@@ -758,7 +772,10 @@ for (const eventName of ['playing', 'canplay', 'seeked']) {
   });
 }
 
-document.addEventListener('visibilitychange', () => scanner.refresh());
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) scanner.persistActive();
+  scanner.refresh();
+});
 window.addEventListener('online', () => scanner.refresh());
 window.addEventListener('offline', () => scanner.refresh());
 navigator.connection?.addEventListener?.('change', () => scanner.refresh());
