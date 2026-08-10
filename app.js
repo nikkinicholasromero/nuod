@@ -13,12 +13,12 @@ const state = {
   candidates: [], candidatesByCountry: new Map(), visible: [], active: null, hls: null,
   countryCodes: new Map(), countryByCode: new Map(), catalogCountries: [], countryChoices: [], countryIndex: -1,
   scanResults: new Map(), failedStreamIds: new Set(),
-  currentCountry: null, countryRequestId: 0, catalogReady: false, playbackBusy: false
+  currentCountry: null, countryRequestId: 0, catalogReady: false, playbackBusy: false, searchQuery: ''
 };
 
 const el = {
   video: document.querySelector('#video'), list: document.querySelector('#channelList'), status: document.querySelector('#status'), scanStatus: document.querySelector('#scanStatus'),
-  country: document.querySelector('#countryFilter'), countryToggle: document.querySelector('#countryToggle'), countryOptions: document.querySelector('#countryOptions'),
+  country: document.querySelector('#countryFilter'), countryToggle: document.querySelector('#countryToggle'), countryOptions: document.querySelector('#countryOptions'), search: document.querySelector('#channelSearch'),
   empty: document.querySelector('#playerEmpty'), loading: document.querySelector('#loadingScreen'), loadingMessage: document.querySelector('#loadingMessage'),
   watchNav: document.querySelector('#watchNav'), browseNav: document.querySelector('#browseNav')
 };
@@ -508,9 +508,11 @@ function renderList(message = '', { scanning = false, preserveScroll = false } =
   const anchor = previousCards.find(card => card.offsetTop + card.offsetHeight > previousScrollTop);
   const anchorOffset = anchor ? anchor.offsetTop - previousScrollTop : 0;
   const anchorKey = anchor?.dataset.key;
-  const items = state.visible;
+  const items = state.searchQuery
+    ? state.visible.filter(item => item.name.toLocaleLowerCase().includes(state.searchQuery))
+    : state.visible;
   el.status.hidden = !message && (items.length > 0 || scanning);
-  el.status.textContent = message || (items.length || scanning ? '' : 'No playable channels found for this country.');
+  el.status.textContent = message || (items.length || scanning ? '' : state.searchQuery ? 'No matching channels.' : 'No playable channels found for this country.');
   el.list.innerHTML = items.map(item => `<button class="channel-card ${state.active?.key === item.key ? 'active' : ''}" data-key="${item.key}"><span class="card-logo">${logo(item)}</span><span class="card-info"><strong>${escapeHTML(item.name)}</strong><small>${escapeHTML(item.countryName || 'Global')}</small></span><span class="quality">${escapeHTML(item.quality || 'LIVE')}</span></button>`).join('');
   if (preserveScroll) {
     const nextAnchor = anchorKey ? el.list.querySelector(`[data-key="${anchorKey}"]`) : null;
@@ -571,6 +573,8 @@ function loadCountry(name, { background = false } = {}) {
 }
 
 function selectCountry(name) {
+  state.searchQuery = '';
+  el.search.value = '';
   el.country.value = name;
   closeCountryMenu();
   loadCountry(name);
@@ -727,6 +731,11 @@ el.countryOptions.addEventListener('mousedown', event => {
 el.countryOptions.addEventListener('click', event => {
   const option = event.target.closest('[data-country]');
   if (option) selectCountry(option.dataset.country);
+});
+el.search.addEventListener('input', () => {
+  state.searchQuery = el.search.value.trim().toLocaleLowerCase();
+  el.list.scrollTop = 0;
+  renderList('', { scanning: scanner.jobs.has(state.currentCountry) });
 });
 document.addEventListener('mousedown', event => {
   if (!event.target.closest('.country-field')) closeCountryMenu();
