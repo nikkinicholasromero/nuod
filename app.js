@@ -1,8 +1,8 @@
 const API = 'https://iptv-org.github.io/api';
-const state = { all: [], visible: [], active: null, hls: null, countryCodes: new Map() };
+const state = { all: [], visible: [], active: null, hls: null, countryCodes: new Map(), countryChoices: [], countryIndex: -1 };
 const el = {
   video: document.querySelector('#video'), list: document.querySelector('#channelList'), status: document.querySelector('#status'),
-  country: document.querySelector('#countryFilter'), countries: document.querySelector('#countries'),
+  country: document.querySelector('#countryFilter'), countryToggle: document.querySelector('#countryToggle'), countryOptions: document.querySelector('#countryOptions'),
   empty: document.querySelector('#playerEmpty'), error: document.querySelector('#playerError'),
   loading: document.querySelector('#loadingScreen'), loadingMessage: document.querySelector('#loadingMessage'),
   watchNav: document.querySelector('#watchNav'), browseNav: document.querySelector('#browseNav')
@@ -28,10 +28,52 @@ function playableStream(stream, blockedChannels) {
 
 function populateCountries(countries) {
   const usedCodes = new Set(state.all.map(item => item.country).filter(Boolean));
-  countries.filter(country => usedCodes.has(country.code)).sort((a, b) => a.name.localeCompare(b.name)).forEach(country => {
-    el.countries.append(new Option(country.name));
+  state.countryChoices = countries.filter(country => usedCodes.has(country.code)).sort((a, b) => a.name.localeCompare(b.name));
+  state.countryChoices.forEach(country => {
     state.countryCodes.set(country.name.toLocaleLowerCase(), country.code);
   });
+}
+
+function renderCountryOptions(query = '') {
+  const normalized = query.trim().toLocaleLowerCase();
+  const matches = state.countryChoices.filter(country => !normalized || country.name.toLocaleLowerCase().includes(normalized)).slice(0, 12);
+  state.countryIndex = matches.length ? 0 : -1;
+  el.countryOptions.innerHTML = matches.length
+    ? matches.map((country, index) => `<li id="country-option-${index}" role="option" data-country="${escapeHTML(country.name)}" aria-selected="${index === 0}">${country.flag || ''}<span>${escapeHTML(country.name)}</span></li>`).join('')
+    : '<li class="country-empty">No matching countries</li>';
+  syncCountryHighlight();
+}
+
+function syncCountryHighlight() {
+  const options = [...el.countryOptions.querySelectorAll('[role="option"]')];
+  options.forEach((option, index) => option.setAttribute('aria-selected', String(index === state.countryIndex)));
+  const active = options[state.countryIndex];
+  if (active) {
+    el.country.setAttribute('aria-activedescendant', active.id);
+    active.scrollIntoView({ block: 'nearest' });
+  } else {
+    el.country.removeAttribute('aria-activedescendant');
+  }
+}
+
+function openCountryMenu(showAll = false) {
+  renderCountryOptions(showAll ? '' : el.country.value);
+  el.countryOptions.hidden = false;
+  el.country.setAttribute('aria-expanded', 'true');
+}
+
+function closeCountryMenu() {
+  el.countryOptions.hidden = true;
+  el.country.setAttribute('aria-expanded', 'false');
+  el.country.removeAttribute('aria-activedescendant');
+  state.countryIndex = -1;
+}
+
+function selectCountry(name) {
+  el.country.value = name;
+  filter();
+  closeCountryMenu();
+  el.country.focus();
 }
 
 function filter() {
@@ -110,7 +152,34 @@ async function init() {
   }
 }
 
-el.country.addEventListener('input', filter);
+el.country.addEventListener('focus', () => openCountryMenu(true));
+el.country.addEventListener('click', () => { if (el.countryOptions.hidden) openCountryMenu(true); });
+el.country.addEventListener('input', () => { filter(); openCountryMenu(); });
+el.country.addEventListener('keydown', event => {
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    event.preventDefault();
+    if (el.countryOptions.hidden) openCountryMenu(true);
+    const options = [...el.countryOptions.querySelectorAll('[role="option"]')];
+    const direction = event.key === 'ArrowDown' ? 1 : -1;
+    state.countryIndex = Math.max(0, Math.min(options.length - 1, state.countryIndex + direction));
+    syncCountryHighlight();
+  } else if (event.key === 'Enter' && !el.countryOptions.hidden) {
+    const active = el.countryOptions.querySelectorAll('[role="option"]')[state.countryIndex];
+    if (active) { event.preventDefault(); selectCountry(active.dataset.country); }
+  } else if (event.key === 'Escape') {
+    closeCountryMenu();
+  }
+});
+el.countryToggle.addEventListener('click', () => {
+  if (el.countryOptions.hidden) { el.country.focus(); openCountryMenu(true); } else closeCountryMenu();
+});
+el.countryOptions.addEventListener('mousedown', event => {
+  const option = event.target.closest('[data-country]');
+  if (option) { event.preventDefault(); selectCountry(option.dataset.country); }
+});
+document.addEventListener('mousedown', event => {
+  if (!event.target.closest('.country-field')) closeCountryMenu();
+});
 el.list.addEventListener('click', event => {
   const card = event.target.closest('[data-key]');
   if (card) play(state.all.find(item => item.key === Number(card.dataset.key)));

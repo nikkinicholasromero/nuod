@@ -24,8 +24,16 @@
           </div>
         </section>
         <aside class="browser-panel" aria-label="Channel list">
-          <div class="filters"><label><span>Country</span><input id="countryFilter" list="countries" value="Philippines" autocomplete="off" spellcheck="false" /></label></div>
-          <datalist id="countries"></datalist>
+          <div class="filters">
+            <div class="country-field">
+              <label for="countryFilter">Country</label>
+              <div class="country-combobox">
+                <input id="countryFilter" value="Philippines" role="combobox" aria-autocomplete="list" aria-controls="countryOptions" aria-expanded="false" autocomplete="off" spellcheck="false" />
+                <button id="countryToggle" type="button" aria-label="Show countries" tabindex="-1">⌄</button>
+                <ul id="countryOptions" class="country-options" role="listbox" hidden></ul>
+              </div>
+            </div>
+          </div>
           <div id="status" class="status">Loading channels…</div>
           <div id="channelList" class="channel-list" aria-live="polite"></div>
         </aside>
