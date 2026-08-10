@@ -193,6 +193,22 @@ function showLoading(message) {
 
 function hideLoading() { el.loading.hidden = true; }
 
+function channelFromUrl() { return new URL(location.href).searchParams.get('channel'); }
+
+function updateChannelUrl(item) {
+  const url = new URL(location.href);
+  if (url.searchParams.get('channel') === item.channelId) return;
+  url.searchParams.set('channel', item.channelId);
+  history.pushState({ channel: item.channelId }, '', url);
+}
+
+function clearChannelUrl() {
+  const url = new URL(location.href);
+  if (!url.searchParams.has('channel')) return;
+  url.searchParams.delete('channel');
+  history.replaceState({}, '', url);
+}
+
 function renderList(message = '') {
   const items = state.visible.slice(0, 150);
   el.status.hidden = items.length > 0 && !message;
@@ -200,13 +216,13 @@ function renderList(message = '') {
   el.list.innerHTML = items.map(item => `<button class="channel-card ${state.active?.key === item.key ? 'active' : ''}" data-key="${item.key}"><span class="card-logo">${logo(item)}</span><span class="card-info"><strong>${escapeHTML(item.name)}</strong><small>${escapeHTML(item.countryName || 'Global')}</small></span><span class="quality">${escapeHTML(item.quality || 'LIVE')}</span></button>`).join('');
 }
 
-async function loadCountry(name) {
+async function loadCountry(name, { background = false } = {}) {
   const code = state.countryCodes.get(name.trim().toLocaleLowerCase());
   if (!code) return;
   const token = ++state.scanToken;
   state.currentCountry = code;
   closeCountryMenu();
-  showLoading('Preparing channel checks…');
+  if (!background) showLoading('Preparing channel checks…');
   const candidates = state.candidates.filter(item => item.country === code);
   let playable = readCachedStreams(code, candidates);
   if (!playable) {
@@ -220,7 +236,7 @@ async function loadCountry(name) {
     el.country.value = '';
   }
   renderList();
-  hideLoading();
+  if (!background) hideLoading();
 }
 
 async function selectCountry(name) {
@@ -244,6 +260,7 @@ function showWatch() {
 }
 
 function removeFailedStream(item) {
+  state.scanToken += 1;
   state.visible = state.visible.filter(stream => stream.url !== item.url);
   state.candidates = state.candidates.filter(stream => stream.url !== item.url);
   invalidateCountryCache(item.country);
@@ -253,13 +270,16 @@ function removeFailedStream(item) {
   el.video.removeAttribute('src');
   el.video.load();
   el.empty.hidden = false;
+  clearChannelUrl();
   showBrowse();
   renderList('That channel became unavailable and was removed.');
 }
 
-function play(item) {
+function play(item, { updateUrl = true } = {}) {
+  if (!item) return;
   state.active = item;
   el.empty.hidden = true;
+  if (updateUrl) updateChannelUrl(item);
   showWatch();
   if (state.hls) { state.hls.destroy(); state.hls = null; }
   el.video.pause();
@@ -275,7 +295,9 @@ function play(item) {
   } else {
     el.video.src = item.url;
   }
-  el.video.play().catch(fail);
+  el.video.play().catch(error => {
+    if (error.name !== 'NotAllowedError' && error.name !== 'AbortError') fail();
+  });
   el.video.onerror = fail;
 }
 
@@ -291,10 +313,22 @@ async function init() {
     state.candidates = data['streams.json'].filter(stream => metadataAllowsStream(stream, blockedChannels) && !seen.has(`${stream.channel}|${stream.url}`) && seen.add(`${stream.channel}|${stream.url}`)).map((stream, key) => {
       const channel = channels.get(stream.channel) || {};
       const country = countries.get(channel.country);
-      return { key, name: stream.title || channel.name || stream.channel, url: stream.url, quality: stream.quality, country: channel.country, countryName: country?.name, logo: logos.get(stream.channel) };
+      return { key, channelId: stream.channel, name: stream.title || channel.name || stream.channel, url: stream.url, quality: stream.quality, country: channel.country, countryName: country?.name, logo: logos.get(stream.channel) };
     });
     populateCountries(data['countries.json']);
-    await loadCountry('Philippines');
+    const requestedChannel = channelFromUrl();
+    const target = requestedChannel ? state.candidates.find(item => item.channelId === requestedChannel) : null;
+    if (target) {
+      el.country.value = target.countryName || '';
+      state.visible = [target];
+      renderList();
+      hideLoading();
+      play(target, { updateUrl: false });
+      loadCountry(target.countryName, { background: true });
+    } else {
+      if (requestedChannel) clearChannelUrl();
+      await loadCountry('Philippines');
+    }
   } catch (error) {
     el.loadingMessage.textContent = 'Could not load channels. Check your connection and refresh.';
     console.error(error);
@@ -335,4 +369,23 @@ el.list.addEventListener('click', event => {
 });
 el.browseNav.addEventListener('click', showBrowse);
 el.watchNav.addEventListener('click', showWatch);
+window.addEventListener('popstate', () => {
+  const requestedChannel = channelFromUrl();
+  if (!requestedChannel) {
+    if (state.hls) { state.hls.destroy(); state.hls = null; }
+    el.video.pause();
+    el.empty.hidden = false;
+    state.active = null;
+    showBrowse();
+    renderList();
+    return;
+  }
+  const target = state.candidates.find(item => item.channelId === requestedChannel);
+  if (target) {
+    el.country.value = target.countryName || '';
+    state.visible = [target];
+    play(target, { updateUrl: false });
+    loadCountry(target.countryName, { background: true });
+  }
+});
 init();
