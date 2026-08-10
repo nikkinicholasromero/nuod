@@ -197,7 +197,7 @@ const scanner = {
       code, candidates, checkedIds, playableIds, pending, activeCount: 0,
       priority: PRIORITY_BACKGROUND, order: this.sequence += 1, sinceFlush: 0,
       checkedAt: previous?.checkedAt || 0, signature: catalogSignature(candidates), promise, resolve,
-      renderTimer: null, hasInconclusive: force ? false : Boolean(previous?.hasInconclusive)
+      renderTimer: null, dispatchCount: 0, hasInconclusive: force ? false : Boolean(previous?.hasInconclusive)
     };
     this.jobs.set(code, job);
     if (!pending.length) queueMicrotask(() => this.finish(job));
@@ -232,13 +232,13 @@ const scanner = {
     this.pump();
   },
 
-  demote(code) {
-    const job = this.jobs.get(code);
-    if (!job || job.priority < PRIORITY_FOREGROUND) return;
-    job.priority = PRIORITY_BACKGROUND;
-    for (const task of this.active) {
-      if (task.job === job) task.controller.abort();
-    }
+  promoteAll() {
+    for (const job of this.jobs.values()) job.priority = PRIORITY_FOREGROUND;
+    this.pump();
+  },
+
+  demoteAll() {
+    for (const job of this.jobs.values()) job.priority = PRIORITY_BACKGROUND;
     this.refresh();
   },
 
@@ -263,11 +263,14 @@ const scanner = {
   nextJob() {
     const jobs = [...this.jobs.values()].filter(job => job.pending.length);
     const foregroundExists = [...this.jobs.values()].some(job => job.priority >= PRIORITY_FOREGROUND && (job.pending.length || job.activeCount));
+    const spreadAcrossCountries = state.currentCountry === EVERYWHERE;
     // Keep background work to one worker per country so a large catalog cannot occupy both lanes.
     const eligible = jobs.filter(job => foregroundExists
-      ? job.priority >= PRIORITY_FOREGROUND
+      ? job.priority >= PRIORITY_FOREGROUND && (!spreadAcrossCountries || job.activeCount === 0)
       : this.canRunBackground() && job.activeCount === 0);
-    return eligible.sort((a, b) => b.priority - a.priority || a.order - b.order)[0] || null;
+    return eligible.sort((a, b) => b.priority - a.priority
+      || (spreadAcrossCountries ? a.dispatchCount - b.dispatchCount : 0)
+      || a.order - b.order)[0] || null;
   },
 
   pump() {
@@ -283,6 +286,7 @@ const scanner = {
   start(job) {
     const item = job.pending.shift();
     if (!item) return;
+    job.dispatchCount += 1;
     const controller = new AbortController();
     const task = { job, item, controller };
     job.activeCount += 1;
@@ -425,7 +429,7 @@ function renderCountryOptions(query = '') {
   const matches = choices.filter(country => !normalized || country.name.toLocaleLowerCase().includes(normalized));
   state.countryIndex = matches.length ? 0 : -1;
   el.countryOptions.innerHTML = matches.length
-    ? matches.map((country, index) => `<li id="country-option-${index}" role="option" data-country="${escapeHTML(country.name)}" aria-selected="${index === 0}">${country.flag || ''}<span>${escapeHTML(country.name)}</span></li>`).join('')
+    ? matches.map((country, index) => `<li id="country-option-${index}" role="option" data-country="${escapeHTML(country.code === EVERYWHERE ? EVERYWHERE : country.name)}" aria-selected="${index === 0}">${country.flag || ''}<span>${escapeHTML(country.name)}</span></li>`).join('')
     : '<li class="country-empty">No matching countries</li>';
   syncCountryHighlight();
 }
@@ -479,7 +483,10 @@ function showScanProgress(job) {
 }
 
 function everywhereStreams() {
-  return state.catalogCountries.flatMap(country => playableStreams(country.code));
+  return state.catalogCountries.flatMap(country => {
+    const liveIds = scanner.jobs.get(country.code)?.playableIds;
+    return streamsFromIds(country.code, liveIds ?? state.scanResults.get(country.code)?.playableIds);
+  });
 }
 
 function everywhereIsScanning() {
@@ -549,8 +556,7 @@ function applyCountryStreams(code, streams, { scanning = false, preserveScroll =
 
 function handleCountryScanComplete(code, streams) {
   if (state.currentCountry === EVERYWHERE) {
-    state.visible = everywhereStreams();
-    renderList('', { scanning: everywhereIsScanning(), preserveScroll: true });
+    scheduleEverywhereRender();
     if (!everywhereIsScanning()) hideScanProgress();
     return;
   }
@@ -602,7 +608,7 @@ function loadEverywhere() {
     const result = state.scanResults.get(country.code);
     scanner.request(country.code, {
       priority: PRIORITY_FOREGROUND,
-      force: Boolean(result?.complete && !result.fresh)
+      force: Boolean(result?.complete)
     }).catch(console.error);
   }
   const scanning = everywhereIsScanning();
@@ -641,7 +647,10 @@ function queueBackgroundScans() {
 function showBrowse() {
   document.body.classList.replace('watch-mode', 'browse-mode');
   scanner.setBackgroundEnabled(false);
-  if (state.currentCountry && state.currentCountry !== EVERYWHERE) {
+  if (state.currentCountry === EVERYWHERE) {
+    scanner.promoteAll();
+    if (everywhereIsScanning()) showEverywhereProgress();
+  } else if (state.currentCountry) {
     scanner.focus(state.currentCountry);
     scanner.promote(state.currentCountry);
   }
@@ -650,6 +659,7 @@ function showBrowse() {
 
 function showWatch() {
   document.body.classList.replace('browse-mode', 'watch-mode');
+  scanner.demoteAll();
   queueBackgroundScans();
 }
 
@@ -684,7 +694,6 @@ function play(item, { updateUrl = true } = {}) {
   if (!item) return;
   state.active = item;
   state.playbackBusy = true;
-  scanner.demote(item.country);
   el.empty.hidden = true;
   if (updateUrl) updateChannelUrl(item);
   showWatch();
