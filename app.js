@@ -4,11 +4,12 @@ const el = {
   video: document.querySelector('#video'), list: document.querySelector('#channelList'), status: document.querySelector('#status'),
   country: document.querySelector('#countryFilter'), countries: document.querySelector('#countries'),
   empty: document.querySelector('#playerEmpty'), error: document.querySelector('#playerError'),
+  loading: document.querySelector('#loadingScreen'), loadingMessage: document.querySelector('#loadingMessage'),
   watchNav: document.querySelector('#watchNav'), browseNav: document.querySelector('#browseNav')
 };
 
 async function getData() {
-  const paths = ['channels.json', 'streams.json', 'logos.json', 'countries.json'];
+  const paths = ['channels.json', 'streams.json', 'logos.json', 'countries.json', 'blocklist.json'];
   const results = await Promise.all(paths.map(path => fetch(`${API}/${path}`).then(response => {
     if (!response.ok) throw new Error(path);
     return response.json();
@@ -19,6 +20,11 @@ async function getData() {
 function initials(name = 'TV') { return name.split(/\s+/).slice(0, 2).map(word => word[0]).join('').toUpperCase(); }
 function logo(item) { return item.logo ? `<img src="${item.logo}" alt="" loading="lazy" onerror="this.remove()">` : initials(item.name); }
 function escapeHTML(value = '') { const node = document.createElement('div'); node.textContent = value; return node.innerHTML; }
+function playableStream(stream, blockedChannels) {
+  const label = (stream.label || '').toLocaleLowerCase();
+  const restricted = /geo|block|restrict|vpn|location|country/.test(label);
+  return stream.channel && typeof stream.url === 'string' && stream.url.startsWith('https://') && !stream.referrer && !stream.user_agent && !restricted && !blockedChannels.has(stream.channel);
+}
 
 function populateCountries(countries) {
   const usedCodes = new Set(state.all.map(item => item.country).filter(Boolean));
@@ -83,19 +89,23 @@ function play(item) {
 async function init() {
   try {
     const data = await getData();
+    el.loadingMessage.textContent = 'Filtering playable channels…';
     const channels = new Map(data['channels.json'].map(channel => [channel.id, channel]));
     const countries = new Map(data['countries.json'].map(country => [country.code, country]));
     const logos = new Map(data['logos.json'].filter(item => item.in_use !== false).map(item => [item.channel, item.url]));
+    const blockedChannels = new Set(data['blocklist.json'].map(item => item.channel));
     const seen = new Set();
-    state.all = data['streams.json'].filter(stream => stream.channel && stream.url && !seen.has(`${stream.channel}|${stream.url}`) && seen.add(`${stream.channel}|${stream.url}`)).map((stream, key) => {
+    state.all = data['streams.json'].filter(stream => playableStream(stream, blockedChannels) && !seen.has(`${stream.channel}|${stream.url}`) && seen.add(`${stream.channel}|${stream.url}`)).map((stream, key) => {
       const channel = channels.get(stream.channel) || {};
       const country = countries.get(channel.country);
       return { key, name: stream.title || channel.name || stream.channel, url: stream.url, quality: stream.quality, country: channel.country, countryName: country?.name, logo: logos.get(stream.channel) };
     }).sort((a, b) => a.name.localeCompare(b.name));
     populateCountries(data['countries.json']);
     filter();
+    el.loading.hidden = true;
   } catch (error) {
     el.status.textContent = 'Could not load the channel list. Check your connection and refresh.';
+    el.loadingMessage.textContent = 'Could not load channels. Check your connection and refresh.';
     console.error(error);
   }
 }
