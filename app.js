@@ -371,7 +371,6 @@ const scanner = {
       result.updatedAt = Date.now();
       writeCountryResult(result);
     }
-    addCountry(item.country);
   },
 
   markFailed(item) {
@@ -404,38 +403,14 @@ const scanner = {
 };
 
 function populateCountries(countries) {
-  const usedCodes = new Set(state.candidatesByCountry.keys());
-  state.catalogCountries = countries.filter(country => usedCodes.has(country.code)).sort((a, b) => a.name.localeCompare(b.name));
+  state.catalogCountries = [...countries].sort((a, b) => a.name.localeCompare(b.name));
   for (const country of state.catalogCountries) {
     state.countryCodes.set(country.name.toLocaleLowerCase(), country.code);
     state.countryByCode.set(country.code, country);
     const result = readCountryResult(country.code, state.candidatesByCountry.get(country.code) || []);
     if (result) state.scanResults.set(country.code, result);
   }
-  state.countryChoices = state.catalogCountries.filter(country => !canHideCountry(country.code));
-}
-
-function canHideCountry(code) {
-  const result = state.scanResults.get(code);
-  return Boolean(result?.complete && result.playableIds.size === 0 && !result.hasInconclusive);
-}
-
-function refreshCountryOptions() {
-  if (!el.countryOptions.hidden) renderCountryOptions(el.country.value);
-}
-
-function addCountry(code) {
-  const country = state.countryByCode.get(code);
-  if (!country || state.countryChoices.some(choice => choice.code === code)) return;
-  state.countryChoices.push(country);
-  state.countryChoices.sort((a, b) => a.name.localeCompare(b.name));
-  refreshCountryOptions();
-}
-
-function removeCountry(code) {
-  const length = state.countryChoices.length;
-  state.countryChoices = state.countryChoices.filter(country => country.code !== code);
-  if (state.countryChoices.length !== length) refreshCountryOptions();
+  state.countryChoices = state.catalogCountries;
 }
 
 function renderCountryOptions(query = '') {
@@ -533,18 +508,13 @@ function renderList(message = '', { scanning = false, preserveScroll = false } =
 function applyCountryStreams(code, streams, { scanning = false, preserveScroll = false } = {}) {
   const active = state.active?.country === code && !state.failedStreamIds.has(streamId(state.active)) ? state.active : null;
   state.visible = active && !streams.some(item => streamId(item) === streamId(active)) ? [active, ...streams] : streams;
-  if (state.visible.length) addCountry(code);
-  else if (!scanning && canHideCountry(code)) removeCountry(code);
   renderList('', { scanning, preserveScroll });
 }
 
 function handleCountryScanComplete(code, streams) {
-  if (streams.length || state.active?.country === code) addCountry(code);
-  else if (canHideCountry(code)) removeCountry(code);
   if (state.currentCountry === code) {
     hideScanProgress(code);
     applyCountryStreams(code, streams, { preserveScroll: true });
-    if (!state.visible.length) el.country.value = '';
   }
 }
 
@@ -559,11 +529,8 @@ function loadCountry(name, { background = false } = {}) {
 
   const result = state.scanResults.get(code);
   const cachedStreams = playableStreams(code, result);
-  const hasUsableCache = Boolean(result && (result.complete || cachedStreams.length));
-
-  if (hasUsableCache) {
-    applyCountryStreams(code, cachedStreams, { scanning: !result.fresh });
-    if (result.complete && result.fresh) return Promise.resolve(cachedStreams);
+  if (result) {
+    applyCountryStreams(code, cachedStreams, { scanning: true });
     const priority = background ? PRIORITY_BACKGROUND : PRIORITY_FOREGROUND;
     const scan = scanner.request(code, { priority, force: result.complete });
     scan.catch(console.error);
@@ -647,7 +614,6 @@ function removeFailedStream(item) {
   scanner.markFailed(item);
   state.visible = state.visible.filter(stream => streamId(stream) !== streamId(item));
   state.candidates = state.candidates.filter(stream => streamId(stream) !== streamId(item));
-  if (!playableStreams(item.country).length && canHideCountry(item.country)) removeCountry(item.country);
   stopPlayback({ clearUrl: true });
   showBrowse();
   renderList('That channel became unavailable and was removed.');
