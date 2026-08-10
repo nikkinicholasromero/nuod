@@ -1,13 +1,19 @@
 const API = 'https://iptv-org.github.io/api';
-const CACHE_VERSION = 2;
-const CACHE_TTL = 15 * 60 * 1000;
+const CACHE_VERSION = 3;
+const CACHE_FRESH_TTL = 60 * 60 * 1000;
+const CACHE_MAX_AGE = 24 * 60 * 60 * 1000;
+const CACHE_FLUSH_INTERVAL = 10;
 const PROBE_CONCURRENCY = 6;
+const BACKGROUND_CONCURRENCY = 2;
 const PROBE_TIMEOUT = 7000;
+const PRIORITY_FOREGROUND = 100;
+const PRIORITY_BACKGROUND = 10;
 
 const state = {
-  candidates: [], visible: [], active: null, hls: null,
-  countryCodes: new Map(), countryChoices: [], countryIndex: -1,
-  currentCountry: null, scanToken: 0
+  candidates: [], candidatesByCountry: new Map(), visible: [], active: null, hls: null,
+  countryCodes: new Map(), countryByCode: new Map(), catalogCountries: [], countryChoices: [], countryIndex: -1,
+  scanResults: new Map(), failedStreamIds: new Set(),
+  currentCountry: null, countryRequestId: 0, catalogReady: false, playbackBusy: false
 };
 
 const el = {
@@ -29,7 +35,20 @@ async function getData() {
 function initials(name = 'TV') { return name.split(/\s+/).slice(0, 2).map(word => word[0]).join('').toUpperCase(); }
 function logo(item) { return item.logo ? `<img src="${item.logo}" alt="" loading="lazy" onerror="this.remove()">` : initials(item.name); }
 function escapeHTML(value = '') { const node = document.createElement('div'); node.textContent = value; return node.innerHTML; }
-function cacheKey(code) { return `nuod:playable:${CACHE_VERSION}:${code}`; }
+function streamId(item) { return `${item.channelId}|${item.url}`; }
+function cacheKey(code) { return `nuod:scan:${CACHE_VERSION}:${code}`; }
+
+function catalogSignature(candidates) {
+  let hash = 2166136261;
+  for (const item of candidates) {
+    const value = streamId(item);
+    for (let index = 0; index < value.length; index += 1) {
+      hash ^= value.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+  }
+  return `${candidates.length}:${(hash >>> 0).toString(36)}`;
+}
 
 function metadataAllowsStream(stream, blockedChannels) {
   const label = (stream.label || '').toLocaleLowerCase();
@@ -37,25 +56,58 @@ function metadataAllowsStream(stream, blockedChannels) {
   return stream.channel && typeof stream.url === 'string' && stream.url.startsWith('https://') && !stream.referrer && !stream.user_agent && !restricted && !blockedChannels.has(stream.channel);
 }
 
-function readCachedStreams(code, candidates) {
+function readCountryResult(code, candidates) {
   try {
     const cached = JSON.parse(localStorage.getItem(cacheKey(code)) || 'null');
-    if (!cached || Date.now() - cached.checkedAt > CACHE_TTL) return null;
-    const urls = new Set(cached.urls);
-    return candidates.filter(item => urls.has(item.url));
-  } catch { return null; }
+    if (!cached || !Array.isArray(cached.checked) || !Array.isArray(cached.playable)) return null;
+    const timestamp = cached.status === 'partial' ? cached.updatedAt : cached.checkedAt;
+    if (!timestamp || Date.now() - timestamp > CACHE_MAX_AGE) return null;
+    const candidateIds = new Set(candidates.map(streamId));
+    const checkedIds = new Set(cached.checked.filter(id => candidateIds.has(id)));
+    const playableIds = new Set(cached.playable.filter(id => candidateIds.has(id)));
+    const complete = cached.status !== 'partial' && candidates.every(item => checkedIds.has(streamId(item)));
+    return {
+      code, checkedIds, playableIds, complete,
+      fresh: complete && Date.now() - cached.checkedAt < CACHE_FRESH_TTL,
+      checkedAt: cached.checkedAt || 0, updatedAt: cached.updatedAt || cached.checkedAt || 0,
+      signature: catalogSignature(candidates)
+    };
+  } catch {
+    return null;
+  }
 }
 
-function writeCachedStreams(code, streams) {
-  try { localStorage.setItem(cacheKey(code), JSON.stringify({ checkedAt: Date.now(), urls: streams.map(item => item.url) })); } catch {}
+function writeCountryResult(result) {
+  const status = result.complete ? (result.playableIds.size ? 'ready' : 'empty') : 'partial';
+  try {
+    localStorage.setItem(cacheKey(result.code), JSON.stringify({
+      status,
+      checkedAt: result.checkedAt || 0,
+      updatedAt: result.updatedAt || Date.now(),
+      catalogSignature: result.signature,
+      checked: [...result.checkedIds],
+      playable: [...result.playableIds]
+    }));
+  } catch {}
 }
 
-function invalidateCountryCache(code) {
-  try { localStorage.removeItem(cacheKey(code)); } catch {}
+function playableStreams(code, result = state.scanResults.get(code)) {
+  if (!result) return [];
+  return (state.candidatesByCountry.get(code) || [])
+    .filter(item => result.playableIds.has(streamId(item)) && !state.failedStreamIds.has(streamId(item)))
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-async function fetchChecked(url, options = {}) {
+function linkedSignal(externalSignal) {
   const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (externalSignal?.aborted) controller.abort();
+  else externalSignal?.addEventListener('abort', abort, { once: true });
+  return { controller, detach: () => externalSignal?.removeEventListener('abort', abort) };
+}
+
+async function fetchChecked(url, options = {}, externalSignal) {
+  const { controller, detach } = linkedSignal(externalSignal);
   const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT);
   try {
     const response = await fetch(url, { cache: 'no-store', redirect: 'follow', ...options, signal: controller.signal });
@@ -63,19 +115,13 @@ async function fetchChecked(url, options = {}) {
     return response;
   } finally {
     clearTimeout(timer);
+    detach();
   }
 }
 
-async function fetchTextChecked(url) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT);
-  try {
-    const response = await fetch(url, { cache: 'no-store', redirect: 'follow', signal: controller.signal });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return await response.text();
-  } finally {
-    clearTimeout(timer);
-  }
+async function fetchTextChecked(url, externalSignal) {
+  const response = await fetchChecked(url, {}, externalSignal);
+  return response.text();
 }
 
 function firstMediaUri(playlist) {
@@ -90,10 +136,10 @@ function taggedUri(playlist, tag) {
   return line?.match(/URI="([^"]+)"/)?.[1] || null;
 }
 
-async function probeHls(url) {
+async function probeHls(url, signal) {
   let playlistUrl = url;
   for (let depth = 0; depth < 3; depth += 1) {
-    const text = await fetchTextChecked(playlistUrl);
+    const text = await fetchTextChecked(playlistUrl, signal);
     if (!text.trimStart().startsWith('#EXTM3U')) return false;
     const media = firstMediaUri(text);
     if (!media.uri) return false;
@@ -104,7 +150,7 @@ async function probeHls(url) {
     }
     const dependencies = [taggedUri(text, '#EXT-X-KEY'), taggedUri(text, '#EXT-X-MAP'), media.uri].filter(Boolean);
     for (const dependency of dependencies) {
-      const resource = await fetchChecked(new URL(dependency, playlistUrl).href, { headers: { Range: 'bytes=0-1023' } });
+      const resource = await fetchChecked(new URL(dependency, playlistUrl).href, { headers: { Range: 'bytes=0-1023' } }, signal);
       await resource.body?.cancel();
     }
     return true;
@@ -112,43 +158,241 @@ async function probeHls(url) {
   return false;
 }
 
-async function probeStream(item) {
+async function probeStream(item, signal) {
   try {
-    if (/\.m3u8(?:$|\?)/i.test(item.url)) return await probeHls(item.url);
-    const response = await fetchChecked(item.url, { headers: { Range: 'bytes=0-1023' } });
+    if (/\.m3u8(?:$|\?)/i.test(item.url)) return await probeHls(item.url, signal);
+    const response = await fetchChecked(item.url, { headers: { Range: 'bytes=0-1023' } }, signal);
     const type = response.headers.get('content-type') || '';
     await response.body?.cancel();
     return /video|audio|mpegurl|octet-stream/i.test(type);
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     return false;
   }
 }
 
-async function probeStreams(candidates, token) {
-  const playable = [];
-  let cursor = 0;
-  let checked = 0;
-  async function worker() {
-    while (cursor < candidates.length && token === state.scanToken) {
-      const item = candidates[cursor++];
-      if (await probeStream(item)) playable.push(item);
-      checked += 1;
-      el.loadingMessage.textContent = `Checking channels… ${checked}/${candidates.length}`;
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(PROBE_CONCURRENCY, candidates.length) }, worker));
-  return playable.sort((a, b) => a.name.localeCompare(b.name));
+function backgroundNetworkAllowed() {
+  const connection = navigator.connection;
+  return navigator.onLine && !document.hidden && !state.playbackBusy && !connection?.saveData && !['slow-2g', '2g'].includes(connection?.effectiveType);
 }
 
+const scanner = {
+  jobs: new Map(), active: new Set(), sequence: 0, backgroundEnabled: false,
+
+  createJob(code, force) {
+    const candidates = state.candidatesByCountry.get(code) || [];
+    const previous = state.scanResults.get(code);
+    const checkedIds = force ? new Set() : new Set(previous?.checkedIds || []);
+    const playableIds = new Set(previous?.playableIds || []);
+    const pending = candidates.filter(item => !checkedIds.has(streamId(item)));
+    let resolve;
+    const promise = new Promise(done => { resolve = done; });
+    const job = {
+      code, candidates, checkedIds, playableIds, pending, activeCount: 0,
+      priority: PRIORITY_BACKGROUND, order: this.sequence += 1, sinceFlush: 0,
+      checkedAt: previous?.checkedAt || 0, signature: catalogSignature(candidates), promise, resolve
+    };
+    this.jobs.set(code, job);
+    if (!pending.length) queueMicrotask(() => this.finish(job));
+    return job;
+  },
+
+  request(code, { priority = PRIORITY_BACKGROUND, force = false } = {}) {
+    const previous = state.scanResults.get(code);
+    if (!force && previous?.complete) return Promise.resolve(playableStreams(code, previous));
+    const job = this.jobs.get(code) || this.createJob(code, force);
+    job.priority = Math.max(job.priority, priority);
+    this.pump();
+    return job.promise;
+  },
+
+  focus(code) {
+    for (const job of this.jobs.values()) {
+      if (job.code !== code && job.priority >= PRIORITY_FOREGROUND) job.priority = PRIORITY_BACKGROUND;
+    }
+    for (const task of this.active) {
+      if (task.job.code !== code) task.controller.abort();
+    }
+    this.pump();
+  },
+
+  setBackgroundEnabled(enabled) {
+    this.backgroundEnabled = enabled;
+    this.refresh();
+  },
+
+  canRunBackground() {
+    return this.backgroundEnabled && backgroundNetworkAllowed();
+  },
+
+  refresh() {
+    if (!this.canRunBackground()) {
+      for (const task of this.active) {
+        if (task.job.priority < PRIORITY_FOREGROUND) task.controller.abort();
+      }
+    }
+    this.pump();
+  },
+
+  nextJob() {
+    const jobs = [...this.jobs.values()].filter(job => job.pending.length);
+    const foregroundExists = [...this.jobs.values()].some(job => job.priority >= PRIORITY_FOREGROUND && (job.pending.length || job.activeCount));
+    const eligible = jobs.filter(job => foregroundExists ? job.priority >= PRIORITY_FOREGROUND : this.canRunBackground());
+    return eligible.sort((a, b) => b.priority - a.priority || a.order - b.order)[0] || null;
+  },
+
+  pump() {
+    while (true) {
+      const job = this.nextJob();
+      if (!job) return;
+      const concurrency = job.priority >= PRIORITY_FOREGROUND ? PROBE_CONCURRENCY : BACKGROUND_CONCURRENCY;
+      if (this.active.size >= concurrency) return;
+      this.start(job);
+    }
+  },
+
+  start(job) {
+    const item = job.pending.shift();
+    if (!item) return;
+    const controller = new AbortController();
+    const task = { job, item, controller };
+    job.activeCount += 1;
+    this.active.add(task);
+    probeStream(item, controller.signal).then(playable => {
+      if (controller.signal.aborted) return;
+      const id = streamId(item);
+      const provenByPlayback = state.active && streamId(state.active) === id && el.video.readyState >= 2;
+      job.checkedIds.add(id);
+      if ((playable || provenByPlayback) && !state.failedStreamIds.has(id)) job.playableIds.add(id);
+      else job.playableIds.delete(id);
+      job.sinceFlush += 1;
+      if (job.sinceFlush >= CACHE_FLUSH_INTERVAL) this.persistPartial(job);
+      this.reportProgress(job);
+    }).catch(() => {
+      if (!controller.signal.aborted) {
+        const id = streamId(item);
+        job.checkedIds.add(id);
+        job.playableIds.delete(id);
+      }
+    }).finally(() => {
+      this.active.delete(task);
+      job.activeCount -= 1;
+      if (controller.signal.aborted && !state.failedStreamIds.has(streamId(item))) job.pending.unshift(item);
+      if (!job.pending.length && !job.activeCount) this.finish(job);
+      this.pump();
+    });
+  },
+
+  reportProgress(job) {
+    if (state.currentCountry === job.code && !el.loading.hidden) {
+      el.loadingMessage.textContent = `Checking channels... ${job.checkedIds.size}/${job.candidates.length}`;
+    }
+  },
+
+  persistPartial(job) {
+    job.sinceFlush = 0;
+    const result = {
+      code: job.code,
+      checkedIds: new Set(job.checkedIds), playableIds: new Set(job.playableIds),
+      complete: false, fresh: false, checkedAt: job.checkedAt,
+      updatedAt: Date.now(), signature: job.signature
+    };
+    state.scanResults.set(job.code, result);
+    writeCountryResult(result);
+  },
+
+  finish(job) {
+    if (this.jobs.get(job.code) !== job || job.activeCount || job.pending.length) return;
+    const result = {
+      code: job.code,
+      checkedIds: new Set(job.checkedIds), playableIds: new Set(job.playableIds),
+      complete: true, fresh: true, checkedAt: Date.now(),
+      updatedAt: Date.now(), signature: job.signature
+    };
+    state.scanResults.set(job.code, result);
+    writeCountryResult(result);
+    this.jobs.delete(job.code);
+    const streams = playableStreams(job.code, result);
+    handleCountryScanComplete(job.code, streams);
+    job.resolve(streams);
+  },
+
+  markPlayable(item) {
+    const id = streamId(item);
+    state.failedStreamIds.delete(id);
+    const job = this.jobs.get(item.country);
+    if (job) {
+      job.checkedIds.add(id);
+      job.playableIds.add(id);
+      job.pending = job.pending.filter(candidate => streamId(candidate) !== id);
+      if (!job.pending.length && !job.activeCount) this.finish(job);
+    }
+    const result = state.scanResults.get(item.country);
+    if (result) {
+      result.checkedIds.add(id);
+      result.playableIds.add(id);
+      result.updatedAt = Date.now();
+      writeCountryResult(result);
+    }
+    addCountry(item.country);
+  },
+
+  markFailed(item) {
+    const id = streamId(item);
+    state.failedStreamIds.add(id);
+    const job = this.jobs.get(item.country);
+    if (job) {
+      job.checkedIds.add(id);
+      job.playableIds.delete(id);
+      job.pending = job.pending.filter(candidate => streamId(candidate) !== id);
+      this.persistPartial(job);
+      if (!job.pending.length && !job.activeCount) this.finish(job);
+    }
+    const result = state.scanResults.get(item.country);
+    if (result) {
+      result.checkedIds.add(id);
+      result.playableIds.delete(id);
+      result.updatedAt = Date.now();
+      writeCountryResult(result);
+    }
+  },
+
+  persistActive() {
+    for (const job of this.jobs.values()) this.persistPartial(job);
+  }
+};
+
 function populateCountries(countries) {
-  const usedCodes = new Set(state.candidates.map(item => item.country).filter(Boolean));
-  state.countryChoices = countries.filter(country => usedCodes.has(country.code)).sort((a, b) => a.name.localeCompare(b.name));
-  state.countryChoices.forEach(country => state.countryCodes.set(country.name.toLocaleLowerCase(), country.code));
+  const usedCodes = new Set(state.candidatesByCountry.keys());
+  state.catalogCountries = countries.filter(country => usedCodes.has(country.code)).sort((a, b) => a.name.localeCompare(b.name));
+  for (const country of state.catalogCountries) {
+    state.countryCodes.set(country.name.toLocaleLowerCase(), country.code);
+    state.countryByCode.set(country.code, country);
+    const result = readCountryResult(country.code, state.candidatesByCountry.get(country.code) || []);
+    if (result) state.scanResults.set(country.code, result);
+  }
+  state.countryChoices = state.catalogCountries.filter(country => {
+    const result = state.scanResults.get(country.code);
+    return !(result?.complete && result.playableIds.size === 0);
+  });
+}
+
+function refreshCountryOptions() {
+  if (!el.countryOptions.hidden) renderCountryOptions(el.country.value);
+}
+
+function addCountry(code) {
+  const country = state.countryByCode.get(code);
+  if (!country || state.countryChoices.some(choice => choice.code === code)) return;
+  state.countryChoices.push(country);
+  state.countryChoices.sort((a, b) => a.name.localeCompare(b.name));
+  refreshCountryOptions();
 }
 
 function removeCountry(code) {
+  const length = state.countryChoices.length;
   state.countryChoices = state.countryChoices.filter(country => country.code !== code);
-  for (const [name, countryCode] of state.countryCodes) if (countryCode === code) state.countryCodes.delete(name);
+  if (state.countryChoices.length !== length) refreshCountryOptions();
 }
 
 function renderCountryOptions(query = '') {
@@ -216,27 +460,52 @@ function renderList(message = '') {
   el.list.innerHTML = items.map(item => `<button class="channel-card ${state.active?.key === item.key ? 'active' : ''}" data-key="${item.key}"><span class="card-logo">${logo(item)}</span><span class="card-info"><strong>${escapeHTML(item.name)}</strong><small>${escapeHTML(item.countryName || 'Global')}</small></span><span class="quality">${escapeHTML(item.quality || 'LIVE')}</span></button>`).join('');
 }
 
+function applyCountryStreams(code, streams) {
+  const active = state.active?.country === code && !state.failedStreamIds.has(streamId(state.active)) ? state.active : null;
+  state.visible = active && !streams.some(item => streamId(item) === streamId(active)) ? [active, ...streams] : streams;
+  if (state.visible.length) addCountry(code);
+  else removeCountry(code);
+  renderList();
+}
+
+function handleCountryScanComplete(code, streams) {
+  if (streams.length || state.active?.country === code) addCountry(code);
+  else removeCountry(code);
+  if (state.currentCountry === code) applyCountryStreams(code, streams);
+}
+
 async function loadCountry(name, { background = false } = {}) {
   const code = state.countryCodes.get(name.trim().toLocaleLowerCase());
   if (!code) return;
-  const token = ++state.scanToken;
+  const requestId = state.countryRequestId += 1;
   state.currentCountry = code;
   closeCountryMenu();
-  if (!background) showLoading('Preparing channel checks…');
-  const candidates = state.candidates.filter(item => item.country === code);
-  let playable = readCachedStreams(code, candidates);
-  if (!playable) {
-    playable = await probeStreams(candidates, token);
-    if (token !== state.scanToken) return;
-    writeCachedStreams(code, playable);
+  if (!background) scanner.focus(code);
+
+  const result = state.scanResults.get(code);
+  const cachedStreams = playableStreams(code, result);
+  const hasUsableCache = Boolean(result && (result.complete || cachedStreams.length));
+
+  if (hasUsableCache) {
+    if (state.currentCountry === code && state.countryRequestId === requestId) applyCountryStreams(code, cachedStreams);
+    if (!background) hideLoading();
+    if (result.complete && result.fresh) return;
+    const priority = !background && !result.complete ? PRIORITY_FOREGROUND : PRIORITY_BACKGROUND;
+    scanner.request(code, { priority, force: result.complete }).catch(console.error);
+    return;
   }
-  state.visible = playable;
-  if (!playable.length) {
-    removeCountry(code);
-    el.country.value = '';
+
+  if (background) {
+    scanner.request(code, { priority: PRIORITY_BACKGROUND }).catch(console.error);
+    return;
   }
-  renderList();
-  if (!background) hideLoading();
+
+  showLoading('Preparing channel checks...');
+  const streams = await scanner.request(code, { priority: PRIORITY_FOREGROUND });
+  if (state.currentCountry !== code || state.countryRequestId !== requestId) return;
+  applyCountryStreams(code, streams);
+  if (!streams.length) el.country.value = '';
+  hideLoading();
 }
 
 async function selectCountry(name) {
@@ -246,10 +515,22 @@ async function selectCountry(name) {
   el.country.focus();
 }
 
+function queueBackgroundScans() {
+  if (!state.catalogReady) return;
+  scanner.setBackgroundEnabled(Boolean(state.active));
+  if (!state.active) return;
+  for (const country of state.catalogCountries) {
+    const result = state.scanResults.get(country.code);
+    if (result?.complete && result.fresh) continue;
+    scanner.request(country.code, { priority: PRIORITY_BACKGROUND, force: Boolean(result?.complete) }).catch(console.error);
+  }
+}
+
 function showBrowse() {
   document.body.classList.replace('watch-mode', 'browse-mode');
   el.browseNav.classList.add('active');
   el.watchNav.classList.remove('active');
+  scanner.setBackgroundEnabled(false);
   closeCountryMenu();
 }
 
@@ -257,13 +538,14 @@ function showWatch() {
   document.body.classList.replace('browse-mode', 'watch-mode');
   el.watchNav.classList.add('active');
   el.browseNav.classList.remove('active');
+  queueBackgroundScans();
 }
 
 function removeFailedStream(item) {
-  state.scanToken += 1;
-  state.visible = state.visible.filter(stream => stream.url !== item.url);
-  state.candidates = state.candidates.filter(stream => stream.url !== item.url);
-  invalidateCountryCache(item.country);
+  scanner.markFailed(item);
+  state.visible = state.visible.filter(stream => streamId(stream) !== streamId(item));
+  state.candidates = state.candidates.filter(stream => streamId(stream) !== streamId(item));
+  if (!playableStreams(item.country).length) removeCountry(item.country);
   state.active = null;
   if (state.hls) { state.hls.destroy(); state.hls = null; }
   el.video.pause();
@@ -278,6 +560,7 @@ function removeFailedStream(item) {
 function play(item, { updateUrl = true } = {}) {
   if (!item) return;
   state.active = item;
+  state.playbackBusy = true;
   el.empty.hidden = true;
   if (updateUrl) updateChannelUrl(item);
   showWatch();
@@ -304,7 +587,7 @@ function play(item, { updateUrl = true } = {}) {
 async function init() {
   try {
     const data = await getData();
-    el.loadingMessage.textContent = 'Building channel catalog…';
+    el.loadingMessage.textContent = 'Building channel catalog...';
     const channels = new Map(data['channels.json'].map(channel => [channel.id, channel]));
     const countries = new Map(data['countries.json'].map(country => [country.code, country]));
     const logos = new Map(data['logos.json'].filter(item => item.in_use !== false).map(item => [item.channel, item.url]));
@@ -315,11 +598,18 @@ async function init() {
       const country = countries.get(channel.country);
       return { key, channelId: stream.channel, name: stream.title || channel.name || stream.channel, url: stream.url, quality: stream.quality, country: channel.country, countryName: country?.name, logo: logos.get(stream.channel) };
     });
+    for (const item of state.candidates) {
+      if (!state.candidatesByCountry.has(item.country)) state.candidatesByCountry.set(item.country, []);
+      state.candidatesByCountry.get(item.country).push(item);
+    }
     populateCountries(data['countries.json']);
+    state.catalogReady = true;
+
     const requestedChannel = channelFromUrl();
     const target = requestedChannel ? state.candidates.find(item => item.channelId === requestedChannel) : null;
     if (target) {
       el.country.value = target.countryName || '';
+      state.currentCountry = target.country;
       state.visible = [target];
       renderList();
       hideLoading();
@@ -327,7 +617,16 @@ async function init() {
       loadCountry(target.countryName, { background: true });
     } else {
       if (requestedChannel) clearChannelUrl();
-      await loadCountry('Philippines');
+      const defaultCountry = state.countryChoices.find(country => country.code === 'PH') || state.countryChoices[0];
+      if (!defaultCountry) {
+        el.country.value = '';
+        state.visible = [];
+        renderList();
+        hideLoading();
+        return;
+      }
+      el.country.value = defaultCountry.name;
+      await loadCountry(defaultCountry.name);
     }
   } catch (error) {
     el.loadingMessage.textContent = 'Could not load channels. Check your connection and refresh.';
@@ -358,7 +657,11 @@ el.countryToggle.addEventListener('click', () => {
 });
 el.countryOptions.addEventListener('mousedown', event => {
   const option = event.target.closest('[data-country]');
-  if (option) { event.preventDefault(); selectCountry(option.dataset.country); }
+  if (option) event.preventDefault();
+});
+el.countryOptions.addEventListener('click', event => {
+  const option = event.target.closest('[data-country]');
+  if (option) selectCountry(option.dataset.country);
 });
 document.addEventListener('mousedown', event => {
   if (!event.target.closest('.country-field')) closeCountryMenu();
@@ -369,6 +672,24 @@ el.list.addEventListener('click', event => {
 });
 el.browseNav.addEventListener('click', showBrowse);
 el.watchNav.addEventListener('click', showWatch);
+
+for (const eventName of ['waiting', 'stalled', 'seeking']) {
+  el.video.addEventListener(eventName, () => { state.playbackBusy = true; scanner.refresh(); });
+}
+for (const eventName of ['playing', 'canplay', 'seeked']) {
+  el.video.addEventListener(eventName, () => {
+    state.playbackBusy = false;
+    if (state.active) scanner.markPlayable(state.active);
+    queueBackgroundScans();
+  });
+}
+
+document.addEventListener('visibilitychange', () => scanner.refresh());
+window.addEventListener('online', () => scanner.refresh());
+window.addEventListener('offline', () => scanner.refresh());
+navigator.connection?.addEventListener?.('change', () => scanner.refresh());
+window.addEventListener('beforeunload', () => scanner.persistActive());
+
 window.addEventListener('popstate', () => {
   const requestedChannel = channelFromUrl();
   if (!requestedChannel) {
@@ -376,6 +697,7 @@ window.addEventListener('popstate', () => {
     el.video.pause();
     el.empty.hidden = false;
     state.active = null;
+    state.playbackBusy = false;
     showBrowse();
     renderList();
     return;
@@ -388,4 +710,5 @@ window.addEventListener('popstate', () => {
     loadCountry(target.countryName, { background: true });
   }
 });
+
 init();
